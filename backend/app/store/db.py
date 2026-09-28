@@ -9,12 +9,15 @@ Milestone 5 (metrics history, alerts).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import aiosqlite
+
+from app.models import Alert, Incident, IncidentEvent
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metrics (
@@ -157,3 +160,145 @@ class Store:
         )
         rows = await cursor.fetchall()
         return [BaselineRow(*row) for row in rows]
+
+    # -- alerts (Milestone 4) -------------------------------------------------
+
+    async def save_alert(self, alert: Alert) -> int:
+        cursor = await self.conn.execute(
+            """
+            INSERT INTO alerts (ts, kind, service, user_id, severity, score, explanation, metrics_json, incident_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                alert.ts.isoformat(), alert.kind, alert.service, alert.user_id, alert.severity, alert.score,
+                alert.explanation, json.dumps(alert.metrics), alert.incident_id,
+            ),
+        )
+        await self.conn.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    async def list_alerts(self, *, limit: int = 100, severity: Optional[str] = None) -> list[Alert]:
+        query = "SELECT id, ts, kind, service, user_id, severity, score, explanation, metrics_json, incident_id FROM alerts"
+        params: list[object] = []
+        if severity is not None:
+            query += " WHERE severity = ?"
+            params.append(severity)
+        query += " ORDER BY ts DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self.conn.execute(query, params)
+        rows = await cursor.fetchall()
+        return [_row_to_alert(row) for row in rows]
+
+    # -- incidents (Milestone 4) -----------------------------------------------
+
+    async def upsert_incident(self, incident: Incident) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO incidents
+                (id, fingerprint, kind, service, user_id, state, peak_severity, alert_count,
+                 opened_at, acknowledged_at, resolved_at, mttr_seconds)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                state=excluded.state, peak_severity=excluded.peak_severity, alert_count=excluded.alert_count,
+                acknowledged_at=excluded.acknowledged_at, resolved_at=excluded.resolved_at,
+                mttr_seconds=excluded.mttr_seconds
+            """,
+            (
+                incident.id, incident.fingerprint, incident.kind, incident.service, incident.user_id,
+                incident.state, incident.peak_severity, incident.alert_count, incident.opened_at.isoformat(),
+                _iso_or_none(incident.acknowledged_at), _iso_or_none(incident.resolved_at), incident.mttr_seconds,
+            ),
+        )
+        await self.conn.commit()
+
+    async def get_incident(self, incident_id: int) -> Optional[Incident]:
+        cursor = await self.conn.execute(
+            """
+            SELECT id, fingerprint, kind, service, user_id, state, peak_severity, alert_count,
+                   opened_at, acknowledged_at, resolved_at, mttr_seconds
+            FROM incidents WHERE id = ?
+            """,
+            (incident_id,),
+        )
+        row = await cursor.fetchone()
+        return _row_to_incident(row) if row else None
+
+    async def list_incidents(self, *, state: Optional[str] = None) -> list[Incident]:
+        query = (
+            "SELECT id, fingerprint, kind, service, user_id, state, peak_severity, alert_count, "
+            "opened_at, acknowledged_at, resolved_at, mttr_seconds FROM incidents"
+        )
+        params: list[object] = []
+        if state is not None:
+            query += " WHERE state = ?"
+            params.append(state)
+        query += " ORDER BY opened_at DESC"
+        cursor = await self.conn.execute(query, params)
+        rows = await cursor.fetchall()
+        return [_row_to_incident(row) for row in rows]
+
+    async def save_incident_event(self, event: IncidentEvent) -> int:
+        cursor = await self.conn.execute(
+            "INSERT INTO incident_events (incident_id, ts, event_type, severity, detail) VALUES (?, ?, ?, ?, ?)",
+            (event.incident_id, event.ts.isoformat(), event.event_type, event.severity, event.detail),
+        )
+        await self.conn.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    async def list_incident_events(self, incident_id: int) -> list[IncidentEvent]:
+        cursor = await self.conn.execute(
+            "SELECT id, incident_id, ts, event_type, severity, detail FROM incident_events "
+            "WHERE incident_id = ? ORDER BY ts ASC",
+            (incident_id,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            IncidentEvent(id=r[0], incident_id=r[1], ts=datetime.fromisoformat(r[2]), event_type=r[3],
+                          severity=r[4], detail=r[5])
+            for r in rows
+        ]
+
+    # -- access_stats (Milestone 4: per-user access baseline persistence) ----
+
+    async def save_access_stat(
+        self, user_id: str, metric: str, mean: float, variance: float, count: int,
+        *, updated_at: Optional[datetime] = None,
+    ) -> None:
+        ts = (updated_at or datetime.now(timezone.utc)).isoformat()
+        await self.conn.execute(
+            """
+            INSERT INTO access_stats (user_id, metric, mean, variance, count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, metric)
+            DO UPDATE SET mean=excluded.mean, variance=excluded.variance,
+                          count=excluded.count, updated_at=excluded.updated_at
+            """,
+            (user_id, metric, mean, variance, count, ts),
+        )
+        await self.conn.commit()
+
+    async def load_access_stats(self) -> list[tuple[str, str, float, float, int]]:
+        cursor = await self.conn.execute("SELECT user_id, metric, mean, variance, count FROM access_stats")
+        return list(await cursor.fetchall())
+
+
+def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value is not None else None
+
+
+def _row_to_alert(row) -> Alert:
+    return Alert(
+        id=row[0], ts=datetime.fromisoformat(row[1]), kind=row[2], service=row[3], user_id=row[4],
+        severity=row[5], score=row[6], explanation=row[7], metrics=json.loads(row[8]), incident_id=row[9],
+    )
+
+
+def _row_to_incident(row) -> Incident:
+    return Incident(
+        id=row[0], fingerprint=row[1], kind=row[2], service=row[3], user_id=row[4], state=row[5],
+        peak_severity=row[6], alert_count=row[7], opened_at=datetime.fromisoformat(row[8]),
+        acknowledged_at=datetime.fromisoformat(row[9]) if row[9] else None,
+        resolved_at=datetime.fromisoformat(row[10]) if row[10] else None, mttr_seconds=row[11],
+    )

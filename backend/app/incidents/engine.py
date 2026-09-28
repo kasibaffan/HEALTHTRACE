@@ -1,0 +1,192 @@
+"""Incident lifecycle: dedup, escalation, cooldown, auto-resolve, MTTR
+(SPEC.md section 6.8).
+
+Two independent sources drive a fingerprint's lifecycle:
+
+- ``record_alert()``: a new Alert for some anomaly. Deduplicated by
+  fingerprint — attached to any existing OPEN/ACKNOWLEDGED incident (bumping
+  ``alert_count`` and ``peak_severity``), or opens a new one.
+- ``record_normal_window()`` / ``sweep_hipaa_timeouts()``: the *absence* of
+  further anomalies, which is what lets a service incident auto-resolve
+  after 6 consecutive normal windows, and a HIPAA incident auto-resolve
+  after 10 minutes with no new matching alert.
+
+Fingerprint: ``(kind, service)`` for service anomalies, ``(kind, user_id)``
+for HIPAA anomalies — SPEC.md's rule exactly.
+
+``IncidentUpdate.should_notify`` is only ever a hint for the AWS notifier
+(Milestone 5) about whether to push a message out. Storage and the
+WebSocket broadcast are unconditional: SPEC.md 6.8 says "every state change
+is written to the incident_events table and broadcast over WebSocket",
+full stop — cooldown only suppresses the *external* notification.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Optional
+
+from app.config import IncidentConfig
+from app.models import Alert, Anomaly, Incident, IncidentEvent, Severity
+
+_SEVERITY_ORDER: dict[Severity, int] = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def fingerprint_for(anomaly: Anomaly) -> str:
+    if anomaly.user_id is not None:
+        return f"{anomaly.kind}:{anomaly.user_id}"
+    return f"{anomaly.kind}:{anomaly.service}"
+
+
+@dataclass
+class _IncidentState:
+    incident: Incident
+    consecutive_normal_windows: int = 0
+    last_alert_ts: Optional[datetime] = None
+    suppressed_until: Optional[datetime] = None  # cooldown, set once this fingerprint resolves
+
+
+@dataclass
+class IncidentUpdate:
+    incident: Incident
+    events: list[IncidentEvent] = field(default_factory=list)
+    should_notify: bool = False
+    is_new: bool = False
+    is_escalation: bool = False
+
+
+class IncidentEngine:
+    def __init__(self, config: IncidentConfig) -> None:
+        self._config = config
+        self._by_fingerprint: dict[str, _IncidentState] = {}
+        self._by_id: dict[int, _IncidentState] = {}
+        self._next_id = 1
+
+    def record_alert(self, anomaly: Anomaly, alert: Alert) -> IncidentUpdate:
+        fp = fingerprint_for(anomaly)
+        state = self._by_fingerprint.get(fp)
+
+        if state is not None and state.incident.state in ("OPEN", "ACKNOWLEDGED"):
+            return self._attach(state, anomaly, alert)
+
+        # No active incident for this fingerprint right now: a fresh one,
+        # possibly still inside the previous incident's cooldown window.
+        in_cooldown = (
+            state is not None
+            and state.incident.state == "RESOLVED"
+            and state.suppressed_until is not None
+            and anomaly.ts < state.suppressed_until
+        )
+        return self._open(fp, anomaly, alert, carry_over_cooldown=state.suppressed_until if in_cooldown else None)
+
+    def _attach(self, state: _IncidentState, anomaly: Anomaly, alert: Alert) -> IncidentUpdate:
+        state.consecutive_normal_windows = 0
+        state.last_alert_ts = anomaly.ts
+        incident = state.incident
+        incident.alert_count += 1
+
+        escalated = _SEVERITY_ORDER[alert.severity] > _SEVERITY_ORDER[incident.peak_severity]
+        if escalated:
+            incident.peak_severity = alert.severity
+
+        in_cooldown = state.suppressed_until is not None and anomaly.ts < state.suppressed_until
+        event = IncidentEvent(
+            incident_id=incident.id,
+            ts=anomaly.ts,
+            event_type="escalated" if escalated else "alert_attached",
+            severity=alert.severity,
+        )
+        return IncidentUpdate(
+            incident=incident, events=[event], should_notify=escalated and not in_cooldown, is_escalation=escalated
+        )
+
+    def _open(
+        self, fingerprint: str, anomaly: Anomaly, alert: Alert, *, carry_over_cooldown: Optional[datetime]
+    ) -> IncidentUpdate:
+        incident = Incident(
+            id=self._next_id,
+            fingerprint=fingerprint,
+            kind=anomaly.kind,
+            service=anomaly.service,
+            user_id=anomaly.user_id,
+            state="OPEN",
+            peak_severity=alert.severity,
+            alert_count=1,
+            opened_at=anomaly.ts,
+        )
+        self._next_id += 1
+
+        new_state = _IncidentState(
+            incident=incident, last_alert_ts=anomaly.ts, suppressed_until=carry_over_cooldown
+        )
+        self._by_fingerprint[fingerprint] = new_state
+        self._by_id[incident.id] = new_state
+
+        event = IncidentEvent(incident_id=incident.id, ts=anomaly.ts, event_type="opened", severity=alert.severity)
+        return IncidentUpdate(
+            incident=incident, events=[event], should_notify=carry_over_cooldown is None, is_new=True
+        )
+
+    def acknowledge(self, incident_id: int, now: datetime) -> Optional[IncidentUpdate]:
+        state = self._by_id.get(incident_id)
+        if state is None or state.incident.state != "OPEN":
+            return None
+        state.incident.state = "ACKNOWLEDGED"
+        state.incident.acknowledged_at = now
+        event = IncidentEvent(incident_id=incident_id, ts=now, event_type="acknowledged")
+        return IncidentUpdate(incident=state.incident, events=[event])
+
+    def resolve(self, incident_id: int, now: datetime) -> Optional[IncidentUpdate]:
+        state = self._by_id.get(incident_id)
+        if state is None or state.incident.state == "RESOLVED":
+            return None
+        return self._resolve(state, now, auto=False)
+
+    def _resolve(self, state: _IncidentState, now: datetime, *, auto: bool) -> IncidentUpdate:
+        incident = state.incident
+        incident.state = "RESOLVED"
+        incident.resolved_at = now
+        incident.mttr_seconds = (now - incident.opened_at).total_seconds()
+        state.suppressed_until = now + timedelta(minutes=self._config.cooldown_minutes)
+        event = IncidentEvent(
+            incident_id=incident.id, ts=now, event_type="auto_resolved" if auto else "resolved"
+        )
+        return IncidentUpdate(incident=incident, events=[event])
+
+    # -- auto-resolve: service incidents (6 consecutive normal windows) -----
+
+    def record_normal_window(self, kind: str, service: str, window_end: datetime) -> Optional[IncidentUpdate]:
+        state = self._by_fingerprint.get(f"{kind}:{service}")
+        if state is None or state.incident.state not in ("OPEN", "ACKNOWLEDGED"):
+            return None
+        state.consecutive_normal_windows += 1
+        if state.consecutive_normal_windows >= self._config.service_auto_resolve_windows:
+            return self._resolve(state, window_end, auto=True)
+        return None
+
+    # -- auto-resolve: HIPAA incidents (10 minutes with no new alert) -------
+
+    def sweep_hipaa_timeouts(self, now: datetime) -> list[IncidentUpdate]:
+        timeout = timedelta(minutes=self._config.hipaa_auto_resolve_minutes)
+        updates = []
+        for state in self._by_fingerprint.values():
+            if state.incident.state not in ("OPEN", "ACKNOWLEDGED"):
+                continue
+            if not state.incident.kind.startswith("hipaa_"):
+                continue
+            if state.last_alert_ts is not None and now - state.last_alert_ts >= timeout:
+                updates.append(self._resolve(state, now, auto=True))
+        return updates
+
+    # -- queries -------------------------------------------------------------
+
+    def get(self, incident_id: int) -> Optional[Incident]:
+        state = self._by_id.get(incident_id)
+        return state.incident if state else None
+
+    def list_incidents(self, *, state: Optional[str] = None) -> list[Incident]:
+        incidents = [s.incident for s in self._by_fingerprint.values()]
+        if state is not None:
+            incidents = [i for i in incidents if i.state == state]
+        return incidents

@@ -54,8 +54,36 @@ exactly that, and is also called out at its own spot in config.yaml):
   window anomalous on latency alone still lets the error-rate baseline learn
   from it, and vice versa. Simplest option that doesn't let an anomaly in
   one metric block learning on an unrelated one.
+- **A user's access baseline samples once per 10-minute period, not per
+  event.** SPEC.md 6.7 says a user has "the user's own EWMA baseline" of
+  distinct-patient access but doesn't say how often it updates. Distinct-
+  patient count *within an ongoing burst* only ever climbs, so updating on
+  every event would let a real bulk-access burst poison its own baseline
+  mid-burst before it finishes — the access-detector analogue of the
+  gradual-ramp problem above, except guaranteed to occur here since a
+  rolling count can't decrease. Sampling once per rolling-window period
+  (same length as the window itself) means a burst shorter than 10 minutes
+  never gets the chance to drag its own threshold up while it's happening.
+- **A brand-new user's bulk-access threshold is the flat floor, not zero.**
+  SPEC.md 6.7 gives the threshold as `max(3 * user_baseline, 50)` without
+  saying what happens before a baseline exists. Treating "no baseline yet"
+  as baseline=0 makes the formula fall through to the flat floor (50)
+  automatically — exactly the right behavior, since a user with no history
+  suddenly touching hundreds of patients is at least as suspicious as one
+  exceeding an established baseline, not exempt from detection until they
+  have one.
+- **Cooldown opens a new incident rather than reopening the resolved one.**
+  SPEC.md 6.8 says a resolved incident's fingerprint suppresses
+  notifications for 5 minutes but "still record[s] the alerts" — read as: a
+  recurrence during cooldown gets its own new incident (since the old one is
+  legitimately done, with its own MTTR already recorded), just with
+  `should_notify=False` carried onto it until the cooldown window elapses,
+  rather than reanimating the resolved incident.
+- **MTTR is measured from `opened_at`, not `acknowledged_at`.** SPEC.md 6.8
+  tracks both timestamps but doesn't spell out which anchors MTTR;
+  "time to resolve" most naturally reads as the incident's full lifetime.
 
-## Status: Milestone 3 — Baseline + anomaly + severity
+## Status: Milestone 4 — Access detector + incident engine + store
 
 Done (Milestone 1):
 
@@ -107,9 +135,24 @@ Done (Milestone 3):
   scenario from SPEC.md §7 confirming it lands in its expected severity
   (27 new tests; 66 total, all passing).
 
-Not built yet (later milestones): access detector, incident engine, the rest
-of the store, API/WebSocket, notifier, and frontend. `make backend`, `make
-frontend`, and `make demo` are placeholders until those exist.
+Done (Milestone 4):
+
+- `backend/app/detect/access.py`: per-user rolling 10-minute HIPAA access
+  detector — bulk access, bulk export, off-hours, and region mismatch —
+  with its own poisoning-protected baseline (see "Design decisions").
+- `backend/app/incidents/engine.py`: full incident lifecycle — fingerprint
+  dedup, escalation, cooldown, auto-resolve (6 normal windows for a service
+  incident, 10 minutes of silence for a HIPAA one), and MTTR.
+- `backend/app/store/db.py`: read/write methods for alerts, incidents,
+  incident_events, and access_stats (metrics history is Milestone 5, tied
+  to the running pipeline).
+- Tests: every access pattern and its edge cases, incident dedup/escalation/
+  cooldown/auto-resolve/MTTR, and store round-trips for everything above
+  (34 new tests; 100 total, all passing).
+
+Not built yet (later milestones): API/WebSocket, notifier, pipeline wiring,
+and frontend. `make backend`, `make frontend`, and `make demo` are
+placeholders until those exist.
 
 ## Setup
 
