@@ -22,7 +22,14 @@ priority_weight:
   routine: 1
 
 baseline:
-  alpha: 0.1
+  # Tuned down from the spec's literal 0.1 (documented in README under
+  # "Design decisions"): at 0.1 the baseline adapts fast enough to chase a
+  # gradual ramp (a sustained ~4-5x rate shift diluted by the 60s window)
+  # before its z-score ever crosses the anomaly threshold, so it's never
+  # caught. 0.05 keeps the baseline "stickier" against exactly this kind of
+  # slow poisoning while still reacting normally to sudden step changes
+  # (those trip the threshold on their very first window regardless of alpha).
+  alpha: 0.05
   warmup_windows: 12
 
 anomaly:
@@ -34,7 +41,15 @@ anomaly:
 
 severity:
   deviation_z_cap: 6
-  patient_factor_cap: 40
+  # Tuned up from the spec's literal 40 (documented in README under "Design
+  # decisions"): at the generator's own suggested rate (20-50 events/sec
+  # across services) a 60s window naturally accumulates hundreds of events
+  # per service, so any sustained elevated error rate saturates a 40-patient
+  # cap immediately regardless of actual severity, collapsing the
+  # patient-impact term to a constant 1.0. 400 keeps it meaningful across
+  # that realistic volume while a truly massive spike (urgent_prior_auth_
+  # failure, eligibility_outage) still saturates it.
+  patient_factor_cap: 400
   criticality_weight: 0.5
   patient_factor_weight: 0.5
   thresholds:

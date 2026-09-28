@@ -10,7 +10,52 @@ Full design: [SPEC.md](SPEC.md). Built one milestone at a time; see
 Only synthetic data is ever used. Patient IDs look like `P-000123`. AWS is
 optional — the app runs fully with no credentials (`AWS_MODE=off`).
 
-## Status: Milestone 2 — Ingest + parse + window
+## Design decisions
+
+Places where SPEC.md was ambiguous, or where its literal constants needed
+tuning once run against real generated traffic (task instruction: tune only
+config.yaml values, never the formulas themselves — every change below is
+exactly that, and is also called out at its own spot in config.yaml):
+
+- **`baseline.alpha`: 0.1 → 0.05.** At 0.1, a *gradual* ramp (like
+  `claims_degradation`'s ~4.5x rate shift, diluted over the 60s sliding
+  window rather than arriving as a step) causes the EWMA baseline to adapt
+  fast enough to chase the ramp before any single window's z-score crosses
+  the anomaly threshold — so it's never caught, no matter how long the
+  scenario runs. 0.05 makes the baseline "stickier" against exactly this
+  slow-poisoning pattern, while sudden step changes (urgent_prior_auth_
+  failure, eligibility_outage, batch_spike) still trip the threshold on
+  their very first window regardless of alpha, since that check runs against
+  the *already-warm* pre-scenario baseline. Verified with
+  `test_poisoning_protection_sustained_outage_does_not_drift_baseline` (an
+  abrupt outage) and the scenario-severity tests (a gradual ramp).
+- **`severity.patient_factor_cap`: 40 → 400.** SPEC.md's own worked example
+  (§6.6) uses a ~100-event window with 23 affected patients, but its
+  generator section (§7) suggests 20-50 events/sec *across all 5 services*,
+  which at the spec's fixed 60s window size means several hundred events —
+  and so several dozen affected patients — accumulate per window for any
+  service carrying real traffic share. At the original cap of 40, that
+  volume saturates the patient-impact term to 1.0 for almost any sustained
+  elevated error rate, collapsing severity down to criticality alone and
+  erasing the patient-impact signal the cap exists to represent. 400 keeps
+  the term meaningful at the generator's realistic scale while true mass
+  incidents (urgent_prior_auth_failure, eligibility_outage) still saturate
+  it.
+- **Two-tier baseline key.** SPEC.md 6.4 describes a per-(service,
+  hour_of_day) baseline plus a "global per-service" fallback but doesn't say
+  how the fallback is keyed internally. Modeled it as one more bucket per
+  service, `hour_of_day = -1`, updated on every window alongside whichever
+  hourly bucket is current — simplest option that needs no separate code
+  path in the store schema.
+- **Poisoning protection is per-metric, not per-window.** SPEC.md 6.4 says
+  "update() is called only when the Anomaly Engine marks the window as
+  normal" without specifying whether that's a single verdict per window or
+  one per metric (error_rate vs latency). Implemented it per-metric: a
+  window anomalous on latency alone still lets the error-rate baseline learn
+  from it, and vice versa. Simplest option that doesn't let an anomaly in
+  one metric block learning on an unrelated one.
+
+## Status: Milestone 3 — Baseline + anomaly + severity
 
 Done (Milestone 1):
 
@@ -40,10 +85,31 @@ Done (Milestone 2):
   `WindowMetrics` every 5s of *event time* (not wall clock).
 - Tests for all of the above (39 total, all passing).
 
-Not built yet (later milestones): baseline/anomaly/severity engines, access
-detector, incident engine, store, API/WebSocket, notifier, and frontend.
-`make backend`, `make frontend`, and `make demo` are placeholders until
-those exist.
+Done (Milestone 3):
+
+- `backend/app/store/db.py`: aiosqlite schema for all 6 tables (SPEC.md
+  6.10), with the `baselines` read/write methods this milestone needs; the
+  rest gain their own methods in Milestones 4-5.
+- `backend/app/detect/baseline.py`: EWMA baseline per (service, hour_of_day)
+  with a global per-service fallback, warm-up, and persistence
+  (save/load against the store).
+- `backend/app/detect/anomaly.py`: z-score checks for error rate and p95
+  latency, with per-metric poisoning protection (only feeds the baseline
+  from windows judged non-anomalous for that metric).
+- `backend/app/detect/severity.py`: the continuous service-anomaly score and
+  the rule-based HIPAA severity table (the HIPAA *detector* that produces
+  its inputs is Milestone 4; this module's formula is ready now).
+- Two config.yaml values tuned against real generator output — see "Design
+  decisions" above.
+- Tests: baseline warm-up/fallback/persistence, poisoning protection under a
+  sustained outage, severity formula boundaries, the HIPAA severity table,
+  and a full enrich→window→baseline→anomaly→severity run of every service
+  scenario from SPEC.md §7 confirming it lands in its expected severity
+  (27 new tests; 66 total, all passing).
+
+Not built yet (later milestones): access detector, incident engine, the rest
+of the store, API/WebSocket, notifier, and frontend. `make backend`, `make
+frontend`, and `make demo` are placeholders until those exist.
 
 ## Setup
 
