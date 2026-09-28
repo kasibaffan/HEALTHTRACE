@@ -1,16 +1,9 @@
-"""Pydantic models shared across the MedGuard backend.
-
-Milestone 1 defines only the raw event shapes emitted by the log generator
-(``AppEvent``, ``AuditEvent``) so the generator's output can be validated
-against them. ``WindowMetrics``, ``Alert``, and ``Incident`` belong to later
-milestones (sliding window, severity engine, incident engine) and are added
-when those pieces are built, per SPEC.md section 8.
-"""
+"""Pydantic models shared across the MedGuard backend (SPEC.md section 4)."""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -58,3 +51,95 @@ class AuditEvent(BaseModel):
     @property
     def is_region_mismatch(self) -> bool:
         return self.patient_region != self.user_region
+
+
+class WindowMetrics(BaseModel):
+    """One 60s-window snapshot for one service, emitted every 5s of event time
+    (SPEC.md section 6.3)."""
+
+    service: Service
+    window_end: datetime
+    total: int
+    errors: int
+    error_rate: float
+    p95_latency_ms: float
+    urgent_errors: int
+    affected_patients_urgent: int
+    affected_patients_routine: int
+    malformed_lines: int = 0
+
+
+AnomalyKind = Literal[
+    "error_rate",
+    "latency_degradation",
+    "hipaa_bulk_access",
+    "hipaa_off_hours",
+    "hipaa_region_mismatch",
+    "hipaa_bulk_export",
+]
+
+
+class Anomaly(BaseModel):
+    """Output of the anomaly engine / access detector (SPEC.md sections 6.5, 6.7)."""
+
+    kind: AnomalyKind
+    ts: datetime
+    service: Optional[Service] = None
+    user_id: Optional[str] = None
+    z: float = 0.0
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    baseline_mean: Optional[float] = None
+    baseline_std: Optional[float] = None
+
+
+Severity = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+IncidentState = Literal["OPEN", "ACKNOWLEDGED", "RESOLVED"]
+
+
+class Alert(BaseModel):
+    """A single detected anomaly, scored and explained (SPEC.md section 6.6)."""
+
+    id: Optional[int] = None
+    ts: datetime
+    kind: AnomalyKind
+    service: Optional[Service] = None
+    user_id: Optional[str] = None
+    severity: Severity
+    score: float
+    explanation: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    incident_id: Optional[int] = None
+
+
+class Incident(BaseModel):
+    """A de-duplicated, lifecycle-tracked group of alerts (SPEC.md section 6.8)."""
+
+    id: Optional[int] = None
+    fingerprint: str
+    kind: AnomalyKind
+    service: Optional[Service] = None
+    user_id: Optional[str] = None
+    state: IncidentState = "OPEN"
+    peak_severity: Severity
+    alert_count: int = 1
+    opened_at: datetime
+    acknowledged_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+    mttr_seconds: Optional[float] = None
+
+
+IncidentEventType = Literal[
+    "opened", "alert_attached", "escalated", "acknowledged", "resolved", "auto_resolved"
+]
+
+
+class IncidentEvent(BaseModel):
+    """One row of an incident's audit trail (SPEC.md section 6.8), also
+    broadcast over the WebSocket as an ``incident_update`` message."""
+
+    id: Optional[int] = None
+    incident_id: int
+    ts: datetime
+    event_type: IncidentEventType
+    severity: Optional[Severity] = None
+    detail: Optional[str] = None

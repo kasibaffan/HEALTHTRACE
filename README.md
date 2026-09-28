@@ -10,28 +10,40 @@ Full design: [SPEC.md](SPEC.md). Built one milestone at a time; see
 Only synthetic data is ever used. Patient IDs look like `P-000123`. AWS is
 optional — the app runs fully with no credentials (`AWS_MODE=off`).
 
-## Status: Milestone 1 — Skeleton + generator
+## Status: Milestone 2 — Ingest + parse + window
 
-Done:
+Done (Milestone 1):
 
 - Repo layout (`config.yaml`, `.env.example`, `Makefile`, `generator/`,
   `backend/`).
-- `backend/app/models.py`: `AppEvent` and `AuditEvent` pydantic models for
-  the two log formats (SPEC.md section 5). `WindowMetrics`, `Alert`, and
-  `Incident` are added in later milestones as the pipeline stages that
-  produce them are built.
+- `backend/app/models.py`: pydantic models for every shape in the pipeline
+  (`AppEvent`, `AuditEvent`, `WindowMetrics`, `Anomaly`, `Alert`, `Incident`,
+  `IncidentEvent`) — filled in incrementally as each milestone needs them.
 - `generator/generate.py` + `generator/scenarios.py`: synthetic log
   generator covering normal traffic and all 9 scenarios from SPEC.md
   section 7.
-- Tests (`backend/tests/test_generator.py`) confirming every generated line
-  validates against the models, and that each scenario produces the traffic
-  shape the spec promises (error rate, urgent mix, patient counts, off-hours
-  timestamps, region mismatches, etc.).
+- Tests confirming every generated line validates against the models, and
+  that each scenario produces the traffic shape the spec promises.
 
-Not built yet (later milestones): the ingestor, parser/enricher, sliding
-window, baseline/anomaly/severity engines, access detector, incident engine,
-store, API/WebSocket, notifier, and frontend. `make backend`, `make
-frontend`, and `make demo` are placeholders until those exist.
+Done (Milestone 2):
+
+- `backend/app/config.py`: loads `config.yaml` (detection constants) and
+  `.env` (AWS mode, paths) via pydantic-settings.
+- `backend/app/ingest/tailer.py`: polling async tailer — handles append,
+  buffered partial lines, in-place truncation, and rotation (new inode at
+  the same path), all without crashing on a missing file.
+- `backend/app/parse/parser.py`: JSON-line -> `AppEvent`/`AuditEvent`,
+  counting malformed lines instead of raising.
+- `backend/app/parse/enricher.py`: attaches service criticality and
+  priority weight to app events.
+- `backend/app/detect/window.py`: per-service 60s sliding window, emitting
+  `WindowMetrics` every 5s of *event time* (not wall clock).
+- Tests for all of the above (39 total, all passing).
+
+Not built yet (later milestones): baseline/anomaly/severity engines, access
+detector, incident engine, store, API/WebSocket, notifier, and frontend.
+`make backend`, `make frontend`, and `make demo` are placeholders until
+those exist.
 
 ## Setup
 
