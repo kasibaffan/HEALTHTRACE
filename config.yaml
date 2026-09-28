@@ -5,17 +5,30 @@
 # later milestones, recorded here now so those milestones don't invent new
 # numbers that drift from the spec.
 
+# label/depends_on are display metadata for the dashboard's service map:
+# depends_on declares which services call which (e.g. prior_auth's
+# "Downstream eligibility check failed" errors). Detection ignores them.
 services:
   prior_auth:
     criticality: 1.0
+    label: Prior Authorization
+    depends_on: [eligibility]
   eligibility:
     criticality: 0.9
+    label: Eligibility
+    depends_on: []
   pharmacy:
     criticality: 0.8
+    label: Pharmacy
+    depends_on: [eligibility]
   claims:
     criticality: 0.6
+    label: Claims
+    depends_on: [eligibility]
   batch:
     criticality: 0.3
+    label: Batch Jobs
+    depends_on: [claims]
 
 priority_weight:
   urgent: 2
@@ -91,6 +104,18 @@ hipaa:
   off_hours_end: "21:00"
   off_hours_high_records: 20
   region_mismatch_medium_max: 5
+  # Business hours above are judged in this zone. Previously they were
+  # judged in UTC while the generator produced staff traffic around the
+  # clock, so for 10 hours a day every ordinary user's every access fired a
+  # HIGH off-hours alert (~90 alerts/sec, 30 permanently-open incidents).
+  # The generator reads this same value and only emits ordinary staff
+  # traffic inside these hours. Tennessee regions -> America/Chicago; change
+  # it (e.g. Asia/Kolkata) to have background staff traffic during your own
+  # daytime demos.
+  timezone: America/Chicago
+  # An unchanged HIPAA pattern for the same user re-alerts at most once per
+  # this many seconds of event time; a severity escalation alerts at once.
+  realert_seconds: 60
 
 incident:
   cooldown_minutes: 5

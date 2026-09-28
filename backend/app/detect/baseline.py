@@ -11,6 +11,7 @@ the one caller responsible for gating updates.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import sqrt
 from typing import Optional
 
 from app.config import BaselineConfig
@@ -98,3 +99,15 @@ class BaselineEngine:
         for row in await store.load_baselines():
             cell = self._cells.setdefault((row.service, row.hour_of_day, row.metric), _EwmaCell())
             cell.mean, cell.variance, cell.count = row.mean, row.variance, row.count
+
+    def cells_for(self, service: str, metric: str) -> list[dict]:
+        """Every learned bucket for one service/metric, for the baseline chart.
+        hour_of_day == GLOBAL_HOUR is the all-hours fallback."""
+        return [
+            {
+                "hour_of_day": hour, "mean": cell.mean, "std": sqrt(max(cell.variance, 0.0)), "count": cell.count,
+                "ready": cell.count >= self._config.warmup_windows,
+            }
+            for (svc, hour, m), cell in sorted(self._cells.items(), key=lambda kv: kv[0][1])
+            if svc == service and m == metric
+        ]

@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS metrics (
     urgent_errors INTEGER NOT NULL,
     affected_patients_urgent INTEGER NOT NULL,
     affected_patients_routine INTEGER NOT NULL,
-    malformed_lines INTEGER NOT NULL DEFAULT 0
+    malformed_lines INTEGER NOT NULL DEFAULT 0,
+    baseline_mean REAL,
+    baseline_std REAL
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_service_ts ON metrics(service, window_end);
 
@@ -90,6 +92,15 @@ CREATE TABLE IF NOT EXISTS baselines (
     PRIMARY KEY (service, hour_of_day, metric)
 );
 
+-- Byte position of each tailed log file, saved together with the baselines so
+-- a restart resumes exactly where the learned state left off.
+CREATE TABLE IF NOT EXISTS tail_positions (
+    path TEXT PRIMARY KEY,
+    file_id INTEGER,
+    offset INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS access_stats (
     user_id TEXT NOT NULL,
     metric TEXT NOT NULL,
@@ -116,12 +127,25 @@ class Store:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
         self._conn: Optional[aiosqlite.Connection] = None
+        self._last_prune_cutoff: Optional[datetime] = None
 
     async def connect(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.db_path)
+        # WAL + NORMAL: commits no longer fsync, which is what capped the
+        # pipeline at ~100 writes/sec during replay and alert bursts.
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
         await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        cursor = await self.conn.execute("PRAGMA table_info(metrics)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        for column in ("baseline_mean", "baseline_std"):
+            if column not in columns:
+                await self.conn.execute(f"ALTER TABLE metrics ADD COLUMN {column} REAL")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -151,8 +175,35 @@ class Store:
         await self.conn.commit()
 
     async def save_baselines(self, rows: list[BaselineRow]) -> None:
-        for row in rows:
-            await self.save_baseline(row)
+        ts = datetime.now(timezone.utc).isoformat()
+        await self.conn.executemany(
+            """
+            INSERT INTO baselines (service, hour_of_day, metric, mean, variance, count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(service, hour_of_day, metric)
+            DO UPDATE SET mean=excluded.mean, variance=excluded.variance,
+                          count=excluded.count, updated_at=excluded.updated_at
+            """,
+            [(r.service, r.hour_of_day, r.metric, r.mean, r.variance, r.count, ts) for r in rows],
+        )
+        await self.conn.commit()
+
+    # -- tail positions --------------------------------------------------------
+
+    async def save_tail_position(self, path: str, file_id: Optional[int], offset: int) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO tail_positions (path, file_id, offset, updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET file_id=excluded.file_id, offset=excluded.offset,
+                                            updated_at=excluded.updated_at
+            """,
+            (path, file_id, offset, datetime.now(timezone.utc).isoformat()),
+        )
+        await self.conn.commit()
+
+    async def load_tail_positions(self) -> dict[str, tuple[Optional[int], int]]:
+        cursor = await self.conn.execute("SELECT path, file_id, offset FROM tail_positions")
+        return {row[0]: (row[1], row[2]) for row in await cursor.fetchall()}
 
     async def load_baselines(self) -> list[BaselineRow]:
         cursor = await self.conn.execute(
@@ -168,17 +219,21 @@ class Store:
             """
             INSERT INTO metrics
                 (service, window_end, total, errors, error_rate, p95_latency_ms,
-                 urgent_errors, affected_patients_urgent, affected_patients_routine, malformed_lines)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 urgent_errors, affected_patients_urgent, affected_patients_routine, malformed_lines,
+                 baseline_mean, baseline_std)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metrics.service, metrics.window_end.isoformat(), metrics.total, metrics.errors,
                 metrics.error_rate, metrics.p95_latency_ms, metrics.urgent_errors,
                 metrics.affected_patients_urgent, metrics.affected_patients_routine, metrics.malformed_lines,
+                metrics.baseline_mean, metrics.baseline_std,
             ),
         )
-        cutoff = (metrics.window_end - timedelta(hours=24)).isoformat()
-        await self.conn.execute("DELETE FROM metrics WHERE window_end < ?", (cutoff,))
+        cutoff = metrics.window_end - timedelta(hours=24)
+        if self._last_prune_cutoff is None or cutoff - self._last_prune_cutoff >= timedelta(minutes=1):
+            await self.conn.execute("DELETE FROM metrics WHERE window_end < ?", (cutoff.isoformat(),))
+            self._last_prune_cutoff = cutoff
         await self.conn.commit()
 
     async def list_metrics(self, *, service: str, minutes: int = 15, before: Optional[datetime] = None) -> list[WindowMetrics]:
@@ -187,7 +242,8 @@ class Store:
         cursor = await self.conn.execute(
             """
             SELECT service, window_end, total, errors, error_rate, p95_latency_ms,
-                   urgent_errors, affected_patients_urgent, affected_patients_routine, malformed_lines
+                   urgent_errors, affected_patients_urgent, affected_patients_routine, malformed_lines,
+                   baseline_mean, baseline_std
             FROM metrics WHERE service = ? AND window_end >= ? ORDER BY window_end ASC
             """,
             (service, since),
@@ -197,7 +253,7 @@ class Store:
             WindowMetrics(
                 service=r[0], window_end=datetime.fromisoformat(r[1]), total=r[2], errors=r[3], error_rate=r[4],
                 p95_latency_ms=r[5], urgent_errors=r[6], affected_patients_urgent=r[7],
-                affected_patients_routine=r[8], malformed_lines=r[9],
+                affected_patients_routine=r[8], malformed_lines=r[9], baseline_mean=r[10], baseline_std=r[11],
             )
             for r in rows
         ]
@@ -219,13 +275,29 @@ class Store:
         assert cursor.lastrowid is not None
         return cursor.lastrowid
 
-    async def list_alerts(self, *, limit: int = 100, severity: Optional[str] = None) -> list[Alert]:
+    async def list_alerts(
+        self,
+        *,
+        limit: int = 100,
+        severity: Optional[str] = None,
+        service: Optional[str] = None,
+        kind: Optional[str] = None,
+        incident_id: Optional[int] = None,
+        user_id: Optional[str] = None,
+    ) -> list[Alert]:
         query = "SELECT id, ts, kind, service, user_id, severity, score, explanation, metrics_json, incident_id FROM alerts"
+        clauses: list[str] = []
         params: list[object] = []
-        if severity is not None:
-            query += " WHERE severity = ?"
-            params.append(severity)
-        query += " ORDER BY ts DESC LIMIT ?"
+        for column, value in (
+            ("severity", severity), ("service", service), ("kind", kind),
+            ("incident_id", incident_id), ("user_id", user_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY ts DESC, id DESC LIMIT ?"
         params.append(limit)
         cursor = await self.conn.execute(query, params)
         rows = await cursor.fetchall()
@@ -265,7 +337,7 @@ class Store:
         row = await cursor.fetchone()
         return _row_to_incident(row) if row else None
 
-    async def list_incidents(self, *, state: Optional[str] = None) -> list[Incident]:
+    async def list_incidents(self, *, state: Optional[str] = None, limit: Optional[int] = None) -> list[Incident]:
         query = (
             "SELECT id, fingerprint, kind, service, user_id, state, peak_severity, alert_count, "
             "opened_at, acknowledged_at, resolved_at, mttr_seconds FROM incidents"
@@ -274,10 +346,62 @@ class Store:
         if state is not None:
             query += " WHERE state = ?"
             params.append(state)
-        query += " ORDER BY opened_at DESC"
+        query += " ORDER BY opened_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
         cursor = await self.conn.execute(query, params)
         rows = await cursor.fetchall()
         return [_row_to_incident(row) for row in rows]
+
+    async def max_incident_id(self) -> int:
+        cursor = await self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM incidents")
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def last_alert_ts_by_incident(self, incident_ids: list[int]) -> dict[int, datetime]:
+        if not incident_ids:
+            return {}
+        marks = ",".join("?" for _ in incident_ids)
+        cursor = await self.conn.execute(
+            f"SELECT incident_id, MAX(ts) FROM alerts WHERE incident_id IN ({marks}) GROUP BY incident_id",
+            incident_ids,
+        )
+        return {row[0]: datetime.fromisoformat(row[1]) for row in await cursor.fetchall()}
+
+    # -- analytics ---------------------------------------------------------------
+
+    async def alert_counts(self, *, since: datetime) -> list[tuple[str, str, str, int]]:
+        """(hour bucket 'YYYY-MM-DDTHH', severity, service-or-'hipaa', count) for alerts since ``since``."""
+        cursor = await self.conn.execute(
+            """
+            SELECT substr(ts, 1, 13) AS hour, severity, COALESCE(service, 'hipaa'), COUNT(*)
+            FROM alerts WHERE ts >= ? GROUP BY hour, severity, COALESCE(service, 'hipaa') ORDER BY hour
+            """,
+            (since.isoformat(),),
+        )
+        return [(r[0], r[1], r[2], r[3]) for r in await cursor.fetchall()]
+
+    async def alert_kind_counts(self, *, since: datetime) -> list[tuple[str, int]]:
+        cursor = await self.conn.execute(
+            "SELECT kind, COUNT(*) FROM alerts WHERE ts >= ? GROUP BY kind ORDER BY COUNT(*) DESC",
+            (since.isoformat(),),
+        )
+        return [(r[0], r[1]) for r in await cursor.fetchall()]
+
+    async def metrics_hourly(self, *, since: datetime) -> list[tuple[str, str, int, int, float]]:
+        """(hour bucket, service, summed total, summed errors, avg p95) from stored windows.
+
+        Each 60s window is re-emitted every 5s, so raw sums over-count events
+        by window/step; callers divide by that factor."""
+        cursor = await self.conn.execute(
+            """
+            SELECT substr(window_end, 1, 13) AS hour, service, SUM(total), SUM(errors), AVG(p95_latency_ms)
+            FROM metrics WHERE window_end >= ? GROUP BY hour, service ORDER BY hour
+            """,
+            (since.isoformat(),),
+        )
+        return [(r[0], r[1], r[2] or 0, r[3] or 0, r[4] or 0.0) for r in await cursor.fetchall()]
 
     async def save_incident_event(self, event: IncidentEvent) -> int:
         cursor = await self.conn.execute(

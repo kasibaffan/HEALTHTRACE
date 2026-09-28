@@ -21,9 +21,12 @@ import json
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
+from zoneinfo import ZoneInfo
+
+import yaml
 
 from generator.scenarios import (
     ALL_SCENARIO_NAMES,
@@ -49,6 +52,36 @@ ROLES = [
     "auditor",
 ]
 NUM_USERS = 30
+CONFIG_YAML_PATH = REPO_ROOT / "config.yaml"
+
+
+@dataclass(frozen=True)
+class BusinessHours:
+    """Staff working hours, read from the same config.yaml keys the backend's
+    HIPAA detector uses, so ordinary traffic never looks like off-hours access."""
+
+    tz: ZoneInfo
+    start: dt_time
+    end: dt_time
+
+    def contains(self, ts: datetime) -> bool:
+        return self.start <= ts.astimezone(self.tz).time() < self.end
+
+    def at_local_hour(self, day: datetime, hour: int) -> datetime:
+        local = day.astimezone(self.tz).replace(hour=hour, minute=0, second=0, microsecond=0)
+        return local.astimezone(timezone.utc)
+
+
+def load_business_hours(path: Path = CONFIG_YAML_PATH) -> BusinessHours:
+    try:
+        hipaa = yaml.safe_load(path.read_text(encoding="utf-8")).get("hipaa", {})
+    except (OSError, AttributeError, yaml.YAMLError):
+        hipaa = {}
+    return BusinessHours(
+        tz=ZoneInfo(hipaa.get("timezone", "UTC")),
+        start=dt_time.fromisoformat(hipaa.get("off_hours_start", "07:00")),
+        end=dt_time.fromisoformat(hipaa.get("off_hours_end", "21:00")),
+    )
 
 # Per-service normal-traffic shape. err_range keeps overall error rate in the
 # spec's 0.5-3% band; urgent_base is each service's normal urgent/routine mix.
@@ -260,6 +293,7 @@ def generate_batch(
     service_scn = get_service_scenario(scenario_name) if scenario_name else None
     access_scn = get_access_scenario(scenario_name) if scenario_name else None
     users = build_user_pool(rng)
+    hours = load_business_hours()
 
     app_events = [
         make_app_event(rng.choices(SERVICES, weights=_service_weights())[0], ts, rng, override=service_scn)
@@ -268,7 +302,9 @@ def generate_batch(
 
     audit_rate = max(rate / 6, 0.5)  # ~30 users browsing steadily; not error-driven
     audit_events = [
-        make_audit_event(rng.choice(users), ts, rng) for ts in _poisson_times(start, duration_s, audit_rate, rng)
+        make_audit_event(rng.choice(users), ts, rng)
+        for ts in _poisson_times(start, duration_s, audit_rate, rng)
+        if hours.contains(ts)
     ]
 
     if access_scn is not None:
@@ -278,8 +314,7 @@ def generate_batch(
             event_ts = ts
             if access_scn.kind == "off_hours" and access_scn.hour_of_day is not None:
                 elapsed = (ts - start).total_seconds()
-                event_ts = start.replace(hour=access_scn.hour_of_day, minute=0, second=0, microsecond=0)
-                event_ts += timedelta(seconds=elapsed)
+                event_ts = hours.at_local_hour(start, access_scn.hour_of_day) + timedelta(seconds=elapsed)
             audit_events.append(
                 make_audit_event(target, event_ts, rng, region_mismatch=(access_scn.kind == "region_mismatch"))
             )
@@ -311,6 +346,7 @@ def run_live(rate: float, log_dir: Path, control_file: Path, rng: random.Random)
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     users = build_user_pool(rng)
+    hours = load_business_hours()
     app_path = log_dir / "app.log"
     audit_path = log_dir / "audit.log"
 
@@ -319,13 +355,19 @@ def run_live(rate: float, log_dir: Path, control_file: Path, rng: random.Random)
     active_until = 0.0
     scenario_started_at = datetime.now(timezone.utc)
     last_control_check = 0.0
-    last_control_mtime: Optional[float] = None
+    # A control file left over from before this process started is history,
+    # not a new injection: without this, every generator restart replayed
+    # whatever scenario the dashboard had last injected.
+    existing = _read_control(control_file)
+    last_control_mtime: Optional[float] = existing[1] if existing else None
 
     audit_rate = max(rate / 6, 0.5)
 
     with app_path.open("a", encoding="utf-8") as app_f, audit_path.open("a", encoding="utf-8") as audit_f:
         next_app = time.monotonic()
         next_audit = time.monotonic()
+        next_target = time.monotonic()
+        scenario_pace = 0.0
 
         while True:
             now_mono = time.monotonic()
@@ -347,38 +389,51 @@ def run_live(rate: float, log_dir: Path, control_file: Path, rng: random.Random)
                             active_access = get_access_scenario(name)
                             active_until = now_mono + duration_s
                             scenario_started_at = datetime.now(timezone.utc)
+                            if active_access is not None:
+                                # The scenario user's accesses are paced to hit
+                                # total_patients over the whole duration, on top
+                                # of (not instead of) ordinary staff traffic.
+                                scenario_pace = active_access.total_patients / max(duration_s, 1.0)
+                                next_target = now_mono
 
             if active_until and now_mono >= active_until:
                 active_service = active_access = None
                 active_until = 0.0
 
-            if now_mono >= next_app:
+            # Emit every event that is due, not one per loop pass: sleep() is
+            # ~15ms on Windows, which capped --rate 30 at ~18 events/sec.
+            if now_mono - next_app > 5.0:
+                next_app = now_mono  # resumed after a stall: don't burst the backlog
+            if now_mono - next_audit > 5.0:
+                next_audit = now_mono
+            while now_mono >= next_app:
                 ts = datetime.now(timezone.utc)
                 service = rng.choices(SERVICES, weights=_service_weights())[0]
                 event = make_app_event(service, ts, rng, override=active_service)
                 app_f.write(json.dumps(event) + "\n")
                 app_f.flush()
-                next_app = now_mono + rng.expovariate(max(rate, 1e-6))
+                next_app += rng.expovariate(max(rate, 1e-6))
 
-            if now_mono >= next_audit:
+            while now_mono >= next_audit:
                 ts = datetime.now(timezone.utc)
-                pace = audit_rate
-                if active_access is not None:
-                    target = _scenario_user_profile(active_access.user_id, "TN-North")
-                    if active_access.kind == "off_hours" and active_access.hour_of_day is not None:
-                        elapsed = (ts - scenario_started_at).total_seconds()
-                        ts = ts.replace(hour=active_access.hour_of_day, minute=0, second=0, microsecond=0)
-                        ts += timedelta(seconds=elapsed)
-                    event = make_audit_event(
-                        target, ts, rng, region_mismatch=(active_access.kind == "region_mismatch")
-                    )
-                    remaining = max(active_until - now_mono, 1.0)
-                    pace = max(active_access.total_patients / remaining, audit_rate)
-                else:
-                    event = make_audit_event(rng.choice(users), ts, rng)
+                if hours.contains(ts):
+                    audit_f.write(json.dumps(make_audit_event(rng.choice(users), ts, rng)) + "\n")
+                    audit_f.flush()
+                # else: staff are off shift, no ordinary record access
+                next_audit += rng.expovariate(audit_rate)
+
+            if active_access is not None and now_mono - next_target > 5.0:
+                next_target = now_mono
+            while active_access is not None and now_mono >= next_target:
+                ts = datetime.now(timezone.utc)
+                if active_access.kind == "off_hours" and active_access.hour_of_day is not None:
+                    elapsed = (ts - scenario_started_at).total_seconds()
+                    ts = hours.at_local_hour(scenario_started_at, active_access.hour_of_day) + timedelta(seconds=elapsed)
+                target = _scenario_user_profile(active_access.user_id, "TN-North")
+                event = make_audit_event(target, ts, rng, region_mismatch=(active_access.kind == "region_mismatch"))
                 audit_f.write(json.dumps(event) + "\n")
                 audit_f.flush()
-                next_audit = now_mono + rng.expovariate(max(pace, 1e-6))
+                next_target += rng.expovariate(max(scenario_pace, 1e-6))
 
             time.sleep(0.01)
 

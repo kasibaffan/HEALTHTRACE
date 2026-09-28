@@ -63,6 +63,23 @@ class IncidentEngine:
         self._by_id: dict[int, _IncidentState] = {}
         self._next_id = 1
 
+    def restore(
+        self, incidents: list[Incident], *, next_id: int, last_alert_ts: dict[int, datetime]
+    ) -> None:
+        """Rehydrate from the store on startup. Without this, ids restart at 1
+        and new incidents overwrite persisted ones (upsert is keyed on id).
+        ``incidents`` is newest-first; only the newest per fingerprint is
+        tracked, matching how the engine itself keys live state."""
+        self._next_id = max(self._next_id, next_id)
+        for incident in incidents:
+            if incident.id is None or incident.fingerprint in self._by_fingerprint:
+                continue
+            state = _IncidentState(incident=incident, last_alert_ts=last_alert_ts.get(incident.id, incident.opened_at))
+            if incident.state == "RESOLVED" and incident.resolved_at is not None:
+                state.suppressed_until = incident.resolved_at + timedelta(minutes=self._config.cooldown_minutes)
+            self._by_fingerprint[incident.fingerprint] = state
+            self._by_id[incident.id] = state
+
     def record_alert(self, anomaly: Anomaly, alert: Alert) -> IncidentUpdate:
         fp = fingerprint_for(anomaly)
         state = self._by_fingerprint.get(fp)
@@ -135,6 +152,20 @@ class IncidentEngine:
         state.incident.state = "ACKNOWLEDGED"
         state.incident.acknowledged_at = now
         event = IncidentEvent(incident_id=incident_id, ts=now, event_type="acknowledged")
+        return IncidentUpdate(incident=state.incident, events=[event])
+
+    def mute(self, incident_id: int, now: datetime, minutes: float) -> Optional[IncidentUpdate]:
+        """Suppress external notifications for this incident's fingerprint
+        (the same mechanism as post-resolve cooldown); 0 minutes unmutes.
+        Detection, storage and the live feed are unaffected."""
+        state = self._by_id.get(incident_id)
+        if state is None:
+            return None
+        until = now + timedelta(minutes=minutes) if minutes > 0 else None
+        state.suppressed_until = until
+        state.incident.muted_until = until
+        detail = f"notifications muted for {minutes:g} min" if until else "notifications unmuted"
+        event = IncidentEvent(incident_id=incident_id, ts=now, event_type="muted", detail=detail)
         return IncidentUpdate(incident=state.incident, events=[event])
 
     def resolve(self, incident_id: int, now: datetime) -> Optional[IncidentUpdate]:

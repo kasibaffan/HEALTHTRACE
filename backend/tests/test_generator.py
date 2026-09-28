@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.models import AppEvent, AuditEvent
-from generator.generate import SERVICES, generate_batch
+from generator.generate import SERVICES, generate_batch, load_business_hours
 from generator.scenarios import ACCESS_SCENARIOS, SERVICE_SCENARIOS
 
 START = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
@@ -117,7 +117,10 @@ def test_access_scenarios_validate(name, scn):
     if scn.kind == "region_mismatch":
         assert all(e["patient_region"] != e["user_region"] for e in target_events)
     if scn.kind == "off_hours":
-        assert all(e["ts"][11:13] == "03" for e in target_events)
+        hours = load_business_hours()
+        local_hours = {AuditEvent.model_validate(e).ts.astimezone(hours.tz).hour for e in target_events}
+        assert local_hours == {3}
+        assert not any(hours.contains(AuditEvent.model_validate(e).ts) for e in target_events)
     # A loose bound: total_patients is a Poisson-process target, not exact, and
     # off_hours_access/region_mismatch use small counts (12-15) where a tight
     # bound would make this test flaky. This still catches a pace/count bug.
@@ -149,3 +152,15 @@ def test_backfill_window_ends_at_the_given_time_and_validates():
 def test_unknown_scenario_name_is_rejected():
     with pytest.raises(ValueError):
         generate_batch("not_a_real_scenario", 10, 10, START, random.Random(1))
+
+
+def test_ordinary_staff_traffic_stays_inside_business_hours():
+    """Regression: ordinary users were generated around the clock while the
+    detector judged 07:00-21:00, so every overnight access fired an off-hours
+    alert. Normal audit traffic must never land outside business hours."""
+    hours = load_business_hours()
+    rng = random.Random(3)
+    start = datetime(2026, 9, 28, 0, 0, tzinfo=timezone.utc)
+    _, audit_events = generate_batch(None, 24 * 3600, 3, start, rng)
+    assert audit_events
+    assert all(hours.contains(AuditEvent.model_validate(e).ts) for e in audit_events)

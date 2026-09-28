@@ -67,6 +67,9 @@ class WindowMetrics(BaseModel):
     affected_patients_urgent: int
     affected_patients_routine: int
     malformed_lines: int = 0
+    # The error-rate baseline in force for this window (None while warming up).
+    baseline_mean: Optional[float] = None
+    baseline_std: Optional[float] = None
 
 
 AnomalyKind = Literal[
@@ -126,10 +129,12 @@ class Incident(BaseModel):
     acknowledged_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     mttr_seconds: Optional[float] = None
+    # Transient (not persisted): external notifications suppressed until then.
+    muted_until: Optional[datetime] = None
 
 
 IncidentEventType = Literal[
-    "opened", "alert_attached", "escalated", "acknowledged", "resolved", "auto_resolved"
+    "opened", "alert_attached", "escalated", "acknowledged", "resolved", "auto_resolved", "muted"
 ]
 
 

@@ -5,6 +5,15 @@ All detection runs off event timestamps (SPEC.md section 1): app and audit
 events advance an internal event-time clock, which is what drives the
 HIPAA incident auto-resolve sweep — not the wall clock — so replay stays
 deterministic.
+
+Restart safety: each tailer's byte position is persisted together with the
+learned baselines (only at moments when every line read has also been
+processed), so a restart resumes exactly where the learned state left off —
+no history is skipped and none is learned twice. A backlog (the first-run
+backfill, or logs written while the backend was down) is processed in
+*replay* mode: detection and storage run as normal, but live clients get a
+progress stream instead of a firehose of historical messages, then a fresh
+snapshot once caught up.
 """
 
 from __future__ import annotations
@@ -12,10 +21,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import sqrt
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from app.api.ws import Broadcaster
 from app.config import AppConfig, Settings
@@ -24,7 +35,7 @@ from app.detect.anomaly import AnomalyEngine
 from app.detect.baseline import BaselineEngine
 from app.detect.severity import score_hipaa_anomaly, score_service_anomaly
 from app.detect.window import SlidingWindow
-from app.incidents.engine import IncidentEngine, IncidentUpdate
+from app.incidents.engine import IncidentEngine, IncidentUpdate, fingerprint_for
 from app.ingest.tailer import Tailer
 from app.models import Alert, Anomaly, AppEvent, AuditEvent, WindowMetrics
 from app.notify.aws import AwsNotifier
@@ -36,6 +47,23 @@ logger = logging.getLogger(__name__)
 
 BASELINE_SAVE_INTERVAL_SECONDS = 60
 HEARTBEAT_INTERVAL_SECONDS = 10
+TICK_SECONDS = 1.0
+STOP_DRAIN_TIMEOUT_SECONDS = 10.0
+RECENT_LOGS = 5000
+LOG_BROADCAST_CAP = 60
+THROUGHPUT_HISTORY = 120
+# Alerts whose event time is older than this (replayed history, or a long
+# backlog after downtime) are stored and shown but not pushed to AWS.
+NOTIFY_MAX_AGE = timedelta(minutes=15)
+
+_SEVERITY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def mask_patient_id(patient_id: Optional[str]) -> Optional[str]:
+    """P-000123 -> P-****23 (SPEC.md 6.12)."""
+    if not patient_id or len(patient_id) < 4:
+        return patient_id
+    return f"{patient_id[:2]}****{patient_id[-2:]}"
 
 
 @dataclass
@@ -50,6 +78,10 @@ class ServiceState:
     baseline_mean: Optional[float] = None
     baseline_std: Optional[float] = None
     z: Optional[float] = None
+    latency_baseline_mean: Optional[float] = None
+    baseline_is_fallback: bool = False
+    affected_patients_urgent: int = 0
+    affected_patients_routine: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +95,10 @@ class ServiceState:
             "baseline_mean": self.baseline_mean,
             "baseline_std": self.baseline_std,
             "z": self.z,
+            "latency_baseline_mean": self.latency_baseline_mean,
+            "baseline_is_fallback": self.baseline_is_fallback,
+            "affected_patients_urgent": self.affected_patients_urgent,
+            "affected_patients_routine": self.affected_patients_routine,
         }
 
 
@@ -93,31 +129,62 @@ class Pipeline:
         self.recent_alerts: list[Alert] = []  # newest last; capped at _MAX_RECENT_ALERTS
         self._MAX_RECENT_ALERTS = 500
 
+        self.recent_logs: "deque[dict[str, Any]]" = deque(maxlen=RECENT_LOGS)
+        self._pending_logs: list[dict[str, Any]] = []
+        self._log_seq = 0
+        self._hipaa_last_alert: dict[str, tuple[datetime, int]] = {}
+
+        self.started_at: Optional[datetime] = None
+        self.events_processed = {"app": 0, "audit": 0}
+        self.alerts_emitted = 0
+        self._throughput: "deque[dict[str, Any]]" = deque(maxlen=THROUGHPUT_HISTORY)
+        self._last_tick_counts = (0, 0)
+        self._last_tick_mono = time.monotonic()
+
+        self.replay_active = False
+        self._replay_total_bytes = 0
+        self._replay_start_bytes = 0
+
         self._event_clock: Optional[datetime] = None
+        self._last_hipaa_sweep: Optional[datetime] = None
         self._tailers: list[Tailer] = []
         self._tasks: list[asyncio.Task] = []
+        self._consumer_task: Optional[asyncio.Task] = None
 
     # -- lifecycle -------------------------------------------------------------
 
     async def start(self) -> None:
+        self.started_at = datetime.now(timezone.utc)
         await self.store.connect()
         await self.baseline.load(self.store)
+        await self._restore_incidents()
         await self.notifier.start()
 
-        # SPEC.md 6.4: "the backend replays this file on first run so every
-        # hour bucket is ready before the demo" — first run meaning no
-        # baselines were persisted from a previous session. On any later
-        # restart, tail from the end as usual so history isn't reprocessed.
-        first_run = self.baseline.is_empty()
-        self._tailers = [
-            Tailer(self.settings.log_dir / "app.log", self.queue, from_start=first_run),
-            Tailer(self.settings.log_dir / "audit.log", self.queue, from_start=first_run),
-        ]
+        positions = await self.store.load_tail_positions()
+        # First run (nothing learned, nothing read): replay existing history,
+        # SPEC.md 6.4. A database from before positions were persisted has
+        # baselines but no positions: keep its old behaviour and tail from
+        # the end rather than learning the same history twice.
+        first_run = not positions and self.baseline.is_empty()
+        self._tailers = []
+        for name in ("app.log", "audit.log"):
+            path = self.settings.log_dir / name
+            saved = positions.get(str(path))
+            self._tailers.append(
+                Tailer(
+                    path, self.queue, from_start=first_run,
+                    resume_file_id=saved[0] if saved else None,
+                    resume_offset=saved[1] if saved else None,
+                )
+            )
+        self._init_replay_tracking()
+
         for tailer in self._tailers:
             self._tasks.append(asyncio.create_task(tailer.run()))
-        self._tasks.append(asyncio.create_task(self._consume()))
-        self._tasks.append(asyncio.create_task(self._periodic_baseline_save()))
+        self._consumer_task = asyncio.create_task(self._consume())
+        self._tasks.append(asyncio.create_task(self._periodic_save()))
         self._tasks.append(asyncio.create_task(self._heartbeat()))
+        self._tasks.append(asyncio.create_task(self._tick()))
 
     async def stop(self) -> None:
         for tailer in self._tailers:
@@ -130,19 +197,104 @@ class Pipeline:
             except asyncio.CancelledError:
                 pass
         self._tasks = []
-        await self.baseline.save(self.store)
+        # Everything the tailers read must be processed before offsets are
+        # saved, or those lines would be skipped on the next start.
+        drained = True
+        if self._consumer_task is not None:
+            try:
+                await asyncio.wait_for(self.queue.join(), timeout=STOP_DRAIN_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                drained = False
+                logger.warning("pipeline: stopping with %d unprocessed lines", self.queue.qsize())
+            self._consumer_task.cancel()
+            try:
+                await self._consumer_task
+            except asyncio.CancelledError:
+                pass
+            self._consumer_task = None
+        await self._save_state(save_positions=drained)
         await self.notifier.stop()
         await self.store.close()
 
-    async def _periodic_baseline_save(self) -> None:
+    async def _restore_incidents(self) -> None:
+        stored = await self.store.list_incidents(limit=500)
+        active_ids = [i.id for i in stored if i.state != "RESOLVED" and i.id is not None]
+        last_alert = await self.store.last_alert_ts_by_incident(active_ids)
+        self.incidents.restore(stored, next_id=await self.store.max_incident_id() + 1, last_alert_ts=last_alert)
+        self.recent_alerts = list(reversed(await self.store.list_alerts(limit=50))) + self.recent_alerts
+
+    def _init_replay_tracking(self) -> None:
+        total = start = 0
+        for tailer in self._tailers:
+            try:
+                size = tailer.path.stat().st_size
+            except FileNotFoundError:
+                continue
+            if tailer._resume_offset is not None and tailer._resume_offset <= size:
+                offset = tailer._resume_offset
+            elif tailer._resume_offset is not None or tailer.from_start:
+                offset = 0
+            else:
+                offset = size
+            total += size
+            start += offset
+        self._replay_total_bytes = total
+        self._replay_start_bytes = start
+        self.replay_active = total - start > 0
+
+    async def _save_state(self, *, save_positions: bool = True) -> None:
+        await self.baseline.save(self.store)
+        if save_positions:
+            for tailer in self._tailers:
+                if tailer.file_id is not None:
+                    await self.store.save_tail_position(str(tailer.path), tailer.file_id, tailer.committed_offset)
+
+    async def _periodic_save(self) -> None:
         while True:
             await asyncio.sleep(BASELINE_SAVE_INTERVAL_SECONDS)
-            await self.baseline.save(self.store)
+            # Positions are only consistent with the baselines when nothing is
+            # in flight between a tailer and the consumer.
+            await self._save_state(save_positions=self.queue._unfinished_tasks == 0)  # noqa: SLF001
 
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
             await self.broadcaster.broadcast({"type": "heartbeat", "ts": datetime.now(timezone.utc).isoformat()})
+
+    async def _tick(self) -> None:
+        """Once a second: throughput sample, batched log stream, replay progress."""
+        while True:
+            await asyncio.sleep(TICK_SECONDS)
+            self._sample_throughput()
+            if self.replay_active:
+                if all(t.caught_up for t in self._tailers) and self.queue._unfinished_tasks == 0:  # noqa: SLF001
+                    self.replay_active = False
+                    self._pending_logs.clear()
+                    await self._save_state()
+                    await self.broadcaster.broadcast(self.snapshot())
+                else:
+                    await self.broadcaster.broadcast({"type": "replay", **self.replay_status()})
+                    continue
+            if self._pending_logs:
+                batch = self._pending_logs[-LOG_BROADCAST_CAP:]
+                dropped = len(self._pending_logs) - len(batch)
+                self._pending_logs = []
+                await self.broadcaster.broadcast({"type": "logs", "events": batch, "dropped": dropped})
+
+    def _sample_throughput(self) -> None:
+        now = time.monotonic()
+        elapsed = max(now - self._last_tick_mono, 1e-6)
+        app, audit = self.events_processed["app"], self.events_processed["audit"]
+        last_app, last_audit = self._last_tick_counts
+        self._throughput.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "app_eps": round((app - last_app) / elapsed, 2),
+                "audit_eps": round((audit - last_audit) / elapsed, 2),
+            }
+        )
+        self._last_tick_counts = (app, audit)
+        self._last_tick_mono = now
 
     # -- ingestion loop ----------------------------------------------------
 
@@ -160,9 +312,12 @@ class Pipeline:
         event = self.parser.parse_line(line)
         if event is None:
             return
+        self._remember_log(event)
         if isinstance(event, AppEvent):
+            self.events_processed["app"] += 1
             await self._process_app_event(event)
         else:
+            self.events_processed["audit"] += 1
             await self._process_audit_event(event)
 
     def _advance_clock(self, ts: datetime) -> None:
@@ -176,18 +331,52 @@ class Pipeline:
         enriched = self.enricher.enrich(event)
         for metrics in self.window.add(enriched):
             await self._process_window_metrics(metrics)
+        await self._sweep_hipaa()
+
+    async def _sweep_hipaa(self) -> None:
+        """HIPAA incidents resolve after 10 quiet minutes of *event time*.
+        App traffic advances that clock too, so the sweep can't depend on audit
+        events arriving (there are none outside business hours). Runs at most
+        once per event-second."""
+        clock = self._event_clock
+        if clock is None:
+            return
+        if self._last_hipaa_sweep is not None and (clock - self._last_hipaa_sweep).total_seconds() < 1:
+            return
+        self._last_hipaa_sweep = clock
+        for update in self.incidents.sweep_hipaa_timeouts(clock):
+            await self.apply_incident_update(update)
 
     async def _process_window_metrics(self, metrics: WindowMetrics) -> None:
         metrics.malformed_lines = self.parser.malformed_lines
+        # The baseline this window is judged against, captured before
+        # evaluate() lets a normal window update it.
+        judged_against = self.baseline.get(metrics.service, metrics.window_end.hour, "error_rate")
+        if judged_against is not None:
+            metrics.baseline_mean = judged_against.mean
+            metrics.baseline_std = sqrt(max(judged_against.variance, 0.0))
         result = self.anomaly_engine.evaluate(metrics)
         self._update_service_state(metrics)
 
         await self.store.save_metrics(metrics)
-        await self.broadcaster.broadcast({"type": "metric", **metrics.model_dump(mode="json")})
+        await self._broadcast_live({"type": "metric", **self.service_states[metrics.service].to_dict(),
+                                    **metrics.model_dump(mode="json")})
 
         criticality = self.config.services[metrics.service].criticality
+        sev = self.config.severity
         for anomaly in result.anomalies:
-            alert = score_service_anomaly(anomaly, metrics, criticality, self.config.severity)
+            alert = score_service_anomaly(anomaly, metrics, criticality, sev)
+            # The inputs of the severity formula, so an investigation can show
+            # exactly how the score was reached.
+            patients = 2 * metrics.affected_patients_urgent + metrics.affected_patients_routine
+            alert.metrics.update({
+                "z": anomaly.z,
+                "baseline_mean": anomaly.baseline_mean,
+                "baseline_std": anomaly.baseline_std,
+                "criticality": criticality,
+                "deviation_factor": min(anomaly.z / sev.deviation_z_cap, 1.0),
+                "patient_factor": min(patients / sev.patient_factor_cap, 1.0),
+            })
             await self._handle_alert(anomaly, alert)
 
         if result.error_rate_normal:
@@ -201,6 +390,7 @@ class Pipeline:
 
     def _update_service_state(self, metrics: WindowMetrics) -> None:
         baseline = self.baseline.get(metrics.service, metrics.window_end.hour, "error_rate")
+        latency_baseline = self.baseline.get(metrics.service, metrics.window_end.hour, "p95_latency_ms")
         z = None
         baseline_std = None
         if baseline is not None:
@@ -218,6 +408,10 @@ class Pipeline:
             baseline_mean=baseline.mean if baseline else None,
             baseline_std=baseline_std,
             z=z,
+            latency_baseline_mean=latency_baseline.mean if latency_baseline else None,
+            baseline_is_fallback=baseline.is_global_fallback if baseline else False,
+            affected_patients_urgent=metrics.affected_patients_urgent,
+            affected_patients_routine=metrics.affected_patients_routine,
         )
 
     # -- audit events: access detector -> severity -> incident --------------
@@ -227,11 +421,26 @@ class Pipeline:
         anomalies = self.access_detector.evaluate(event)
         for anomaly in anomalies:
             alert = score_hipaa_anomaly(anomaly, self.config.hipaa)
-            await self._handle_alert(anomaly, alert)
+            if self._hipaa_should_alert(anomaly, alert):
+                await self._handle_alert(anomaly, alert)
 
-        if self._event_clock is not None:
-            for update in self.incidents.sweep_hipaa_timeouts(self._event_clock):
-                await self.apply_incident_update(update)
+        await self._sweep_hipaa()
+
+    def _hipaa_should_alert(self, anomaly: Anomaly, alert: Alert) -> bool:
+        """The access detector reports a pattern on every event that exhibits
+        it; re-alerting an unchanged pattern more than once per
+        ``realert_seconds`` only floods storage, the feed and CloudWatch.
+        An escalation in severity always gets through immediately."""
+        fp = fingerprint_for(anomaly)
+        rank = _SEVERITY_RANK[alert.severity]
+        last = self._hipaa_last_alert.get(fp)
+        if last is not None:
+            last_ts, last_rank = last
+            elapsed = (anomaly.ts - last_ts).total_seconds()
+            if rank <= last_rank and 0 <= elapsed < self.config.hipaa.realert_seconds:
+                return False
+        self._hipaa_last_alert[fp] = (anomaly.ts, rank)
+        return True
 
     # -- shared: alerts -> incidents -> store/broadcast/notify --------------
 
@@ -239,46 +448,117 @@ class Pipeline:
         update = self.incidents.record_alert(anomaly, alert)
         alert.incident_id = update.incident.id
 
+        alert.id = await self.store.save_alert(alert)
         self._remember_alert(alert)
-        self.notifier.notify_alert(alert)  # CloudWatch: every alert
-        await self.store.save_alert(alert)
-        await self.broadcaster.broadcast({"type": "alert", **alert.model_dump(mode="json")})
+        self.alerts_emitted += 1
+        fresh = datetime.now(timezone.utc) - alert.ts <= NOTIFY_MAX_AGE
+        if fresh:
+            self.notifier.notify_alert(alert)  # CloudWatch: every alert
+        await self._broadcast_live({"type": "alert", **alert.model_dump(mode="json")})
 
         await self.apply_incident_update(update)
-        if update.should_notify and (update.is_new or update.is_escalation):
+        if fresh and update.should_notify and (update.is_new or update.is_escalation):
             self.notifier.notify_incident(update.incident, alert.explanation)
 
     async def apply_incident_update(self, update: IncidentUpdate) -> None:
         await self.store.upsert_incident(update.incident)
         for event in update.events:
-            await self.store.save_incident_event(event)
-            await self.broadcaster.broadcast(
+            event.id = await self.store.save_incident_event(event)
+            await self._broadcast_live(
                 {"type": "incident_update", "incident": update.incident.model_dump(mode="json"),
                  **event.model_dump(mode="json")}
             )
+
+    async def _broadcast_live(self, message: dict[str, Any]) -> None:
+        if not self.replay_active:
+            await self.broadcaster.broadcast(message)
 
     def _remember_alert(self, alert: Alert) -> None:
         self.recent_alerts.append(alert)
         if len(self.recent_alerts) > self._MAX_RECENT_ALERTS:
             self.recent_alerts = self.recent_alerts[-self._MAX_RECENT_ALERTS :]
 
-    # -- read models for the API (Milestone 5) -------------------------------
+    def _remember_log(self, event: Union[AppEvent, AuditEvent]) -> None:
+        self._log_seq += 1
+        if isinstance(event, AppEvent):
+            record = {
+                "seq": self._log_seq, "ts": event.ts.isoformat(), "type": "app", "service": event.service,
+                "level": event.level, "priority": event.priority, "request_id": event.request_id,
+                "patient_id": mask_patient_id(event.patient_id), "status": event.status,
+                "latency_ms": event.latency_ms, "msg": event.msg, "is_error": event.is_error,
+            }
+        else:
+            record = {
+                "seq": self._log_seq, "ts": event.ts.isoformat(), "type": "audit", "user_id": event.user_id,
+                "role": event.role, "action": event.action, "patient_id": mask_patient_id(event.patient_id),
+                "patient_region": event.patient_region, "user_region": event.user_region,
+                "region_mismatch": event.is_region_mismatch,
+                "level": "WARN" if event.is_region_mismatch or event.action == "EXPORT_RECORDS" else "INFO",
+                "msg": f"{event.user_id} {event.action} {mask_patient_id(event.patient_id)}",
+            }
+        self.recent_logs.append(record)
+        if not self.replay_active:
+            self._pending_logs.append(record)
+            if len(self._pending_logs) > LOG_BROADCAST_CAP * 20:
+                del self._pending_logs[: -LOG_BROADCAST_CAP]
+
+    # -- read models for the API ---------------------------------------------
+
+    def replay_status(self) -> dict[str, Any]:
+        remaining = sum(max(t.file_size - t.committed_offset, 0) for t in self._tailers)
+        todo = max(self._replay_total_bytes - self._replay_start_bytes, 1)
+        done = max(todo - remaining, 0)
+        return {
+            "active": self.replay_active,
+            "progress": round(min(done / todo, 1.0), 4) if self.replay_active else 1.0,
+            "event_clock": self._event_clock.isoformat() if self._event_clock else None,
+            "events_processed": sum(self.events_processed.values()),
+        }
 
     def health_snapshot(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        lag = (now - self._event_clock).total_seconds() if self._event_clock else None
+        recent = list(self._throughput)
         return {
-            "status": "ok",
+            "status": "replaying" if self.replay_active else "ok",
             "queue_depth": self.queue.qsize(),
             "malformed_lines": self.parser.malformed_lines,
             "aws_mode": self.settings.aws_mode,
             "notifier_queue_depth": self.notifier.queue_depth,
+            "demo_mode": self.settings.demo_mode,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "uptime_seconds": (now - self.started_at).total_seconds() if self.started_at else 0,
+            "event_clock": self._event_clock.isoformat() if self._event_clock else None,
+            "event_lag_seconds": lag,
+            "events_processed": dict(self.events_processed),
+            "alerts_emitted": self.alerts_emitted,
+            "ws_clients": self.broadcaster.client_count,
+            "throughput": recent[-1] if recent else {"app_eps": 0.0, "audit_eps": 0.0},
+            "throughput_history": recent[-60:],
+            "replay": self.replay_status(),
+            "tailers": [
+                {"path": t.path.name, "offset": t.committed_offset, "size": t.file_size, "caught_up": t.caught_up}
+                for t in self._tailers
+            ],
         }
 
     def services_snapshot(self) -> list[dict[str, Any]]:
         known = set(self.config.services) | set(self.service_states)
-        return [
-            self.service_states[s].to_dict() if s in self.service_states else ServiceState(service=s).to_dict()
-            for s in sorted(known)
-        ]
+        active = [i for i in self.incidents.list_incidents() if i.state != "RESOLVED" and i.service]
+        out = []
+        for s in sorted(known):
+            row = self.service_states[s].to_dict() if s in self.service_states else ServiceState(service=s).to_dict()
+            mine = [i for i in active if i.service == s]
+            svc_cfg = self.config.services.get(s)
+            row["criticality"] = svc_cfg.criticality if svc_cfg else None
+            row["label"] = (svc_cfg.label if svc_cfg else None) or s
+            row["depends_on"] = svc_cfg.depends_on if svc_cfg else []
+            row["active_incidents"] = len(mine)
+            row["worst_severity"] = max((i.peak_severity for i in mine), key=_SEVERITY_RANK.__getitem__, default=None)
+            row["baseline_ready"] = row["baseline_mean"] is not None
+            row["requests_per_second"] = row["total"] / self.config.window.size_seconds
+            out.append(row)
+        return out
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -287,6 +567,8 @@ class Pipeline:
             "alerts": [a.model_dump(mode="json") for a in self.recent_alerts[-50:]],
             "incidents": [i.model_dump(mode="json") for i in self.incidents.list_incidents()],
             "metrics": {s.service: s.to_dict() for s in self.service_states.values()},
+            "health": self.health_snapshot(),
+            "logs": list(self.recent_logs)[-100:],
         }
 
     def write_control_file(self, scenario: str, duration_s: float) -> None:

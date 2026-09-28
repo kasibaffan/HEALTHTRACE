@@ -41,6 +41,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, time as dt_time, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from app.config import HipaaConfig
 from app.models import Anomaly, AuditEvent
@@ -72,6 +73,7 @@ class AccessDetector:
         self._users: dict[str, _UserState] = {}
         self._off_hours_start = dt_time.fromisoformat(config.off_hours_start)
         self._off_hours_end = dt_time.fromisoformat(config.off_hours_end)
+        self._tz = ZoneInfo(config.timezone)
 
     def evaluate(self, event: AuditEvent) -> list[Anomaly]:
         state = self._users.setdefault(event.user_id, _UserState())
@@ -157,7 +159,8 @@ class AccessDetector:
     # -- helpers ---------------------------------------------------------------
 
     def _is_off_hours(self, ts: datetime) -> bool:
-        return not (self._off_hours_start <= ts.time() < self._off_hours_end)
+        local = ts.astimezone(self._tz).time() if ts.tzinfo else ts.time()
+        return not (self._off_hours_start <= local < self._off_hours_end)
 
     def _evict_expired(self, state: _UserState, as_of: datetime) -> None:
         cutoff = as_of - ROLLING_WINDOW
@@ -170,3 +173,25 @@ class AccessDetector:
         else:
             state.baseline_mean += self._alpha * (distinct_patients - state.baseline_mean)
         state.baseline_count += 1
+
+    def user_summaries(self) -> list[dict]:
+        """Current rolling-window picture per user, for the HIPAA panel."""
+        out = []
+        for user_id, state in self._users.items():
+            if not state.records:
+                continue
+            baseline = state.baseline_mean if state.baseline_count > 0 else 0.0
+            out.append(
+                {
+                    "user_id": user_id,
+                    "distinct_patients": len({r.patient_id for r in state.records}),
+                    "events": len(state.records),
+                    "exports": sum(1 for r in state.records if r.action == "EXPORT_RECORDS"),
+                    "off_hours_events": sum(1 for r in state.records if r.off_hours),
+                    "region_mismatch_patients": len({r.patient_id for r in state.records if r.region_mismatch}),
+                    "baseline": baseline if state.baseline_count > 0 else None,
+                    "bulk_threshold": max(self._config.bulk_multiplier_high * baseline, self._config.bulk_min_threshold),
+                    "last_seen": state.records[-1].ts.isoformat(),
+                }
+            )
+        return sorted(out, key=lambda u: u["distinct_patients"], reverse=True)
