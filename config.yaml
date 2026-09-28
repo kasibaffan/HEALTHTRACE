@@ -1,0 +1,62 @@
+# MedGuard configuration (SPEC.md section 6.2 and 6.6).
+# Only the values needed by Milestone 1 (generator + service metadata) are
+# used today; the rest of the sections below are the literal constants the
+# spec calls out for the baseline/anomaly/severity/incident engines built in
+# later milestones, recorded here now so those milestones don't invent new
+# numbers that drift from the spec.
+
+services:
+  prior_auth:
+    criticality: 1.0
+  eligibility:
+    criticality: 0.9
+  pharmacy:
+    criticality: 0.8
+  claims:
+    criticality: 0.6
+  batch:
+    criticality: 0.3
+
+priority_weight:
+  urgent: 2
+  routine: 1
+
+baseline:
+  alpha: 0.1
+  warmup_windows: 12
+
+anomaly:
+  min_std: 0.01
+  error_rate_z_threshold: 3.0
+  error_rate_min_errors: 5
+  error_rate_min_rate: 0.05
+  latency_z_threshold: 4.0
+
+severity:
+  deviation_z_cap: 6
+  patient_factor_cap: 40
+  criticality_weight: 0.5
+  patient_factor_weight: 0.5
+  thresholds:
+    low_max: 0.30
+    medium_max: 0.50
+    high_max: 0.75
+
+hipaa:
+  bulk_multiplier_high: 3
+  bulk_multiplier_critical: 6
+  bulk_min_threshold: 50
+  export_critical_records: 100
+  off_hours_start: "07:00"
+  off_hours_end: "21:00"
+  off_hours_high_records: 20
+  region_mismatch_medium_max: 5
+
+incident:
+  cooldown_minutes: 5
+  service_auto_resolve_windows: 6
+  hipaa_auto_resolve_minutes: 10
+
+window:
+  size_seconds: 60
+  step_seconds: 5

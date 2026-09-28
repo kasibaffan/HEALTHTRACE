@@ -1,0 +1,26 @@
+[project]
+name = "medguard-backend"
+version = "0.1.0"
+description = "MedGuard: healthcare log-pipeline anomaly detector (SPEC.md)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "aiosqlite>=0.20",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "PyYAML>=6.0",
+    "boto3>=1.34",
+]
+
+[project.optional-dependencies]
+# Milestone 1 only needs pydantic + pytest (already covered above / below);
+# the rest of the dependency list is the full tech stack (SPEC.md section 2),
+# declared up front so later milestones don't need to edit this file.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
