@@ -8,3 +8,7 @@ venv/
 node_modules/
 frontend/dist/
 *.egg-info/
+# local tooling, never committed
+.claude/
+.agents/
+skills-lock.json

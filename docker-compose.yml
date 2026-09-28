@@ -1,0 +1,47 @@
+# Local stack: backend (API + WebSocket + UI) and the synthetic log generator,
+# sharing one data volume, exactly as the ECS task does in AWS.
+#   docker compose up --build        then open http://localhost:8080
+
+x-image: &image
+  build: .
+  image: healthtrace:local
+
+services:
+  backend:
+    <<: *image
+    ports:
+      - "8080:8000"
+    environment:
+      AWS_MODE: ${AWS_MODE:-mock}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:-}
+      DEMO_MODE: "true"
+      ENVIRONMENT: docker
+      CORS_ORIGINS: ""
+      OPERATOR_TOKEN: ${OPERATOR_TOKEN:-}
+    volumes:
+      - data:/app/data
+    restart: unless-stopped
+
+  generator:
+    <<: *image
+    # Seed a little history on first start so baselines can warm up, then stream.
+    command:
+      - sh
+      - -c
+      - |
+        if [ ! -s /app/data/logs/app.log ]; then
+          python -m generator.generate --backfill-hours "$${BACKFILL_HOURS:-2}"
+        fi
+        exec python -m generator.generate --rate "$${RATE:-30}"
+    environment:
+      BACKFILL_HOURS: ${BACKFILL_HOURS:-2}
+      RATE: ${RATE:-30}
+    volumes:
+      - data:/app/data
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+volumes:
+  data:

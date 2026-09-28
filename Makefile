@@ -1,4 +1,4 @@
-.PHONY: gen backfill backend frontend test demo
+.PHONY: gen backfill backend frontend build test demo deploy
 
 # Continuous normal traffic, polling data/control.json for demo injections.
 # Run as a module (not `python generator/generate.py`) so its `from
@@ -10,17 +10,21 @@ gen:
 backfill:
 	python -m generator.generate --backfill-hours 24
 
-# Wired up in Milestone 5 (API + WebSocket).
 backend:
-	cd backend && uvicorn app.main:app --reload
+	cd backend && uvicorn app.main:app --reload --port 8010
 
-# Wired up in Milestone 6 (Frontend).
 frontend:
 	cd frontend && npm run dev
+
+build:
+	cd frontend && npm ci && npm run build
 
 test:
 	python -m pytest backend/tests -q
 
-# Wired up in Milestone 7: backfill + generator + backend + frontend together.
+# Backfill + generator + backend + UI in containers, on http://localhost:8080.
 demo:
-	@echo "make demo is assembled in Milestone 7 once the backend and frontend exist."
+	docker compose up --build
+
+deploy:
+	./deploy/aws/deploy.sh

@@ -1,0 +1,17 @@
+.git
+.venv
+venv
+data
+**/__pycache__
+**/*.pyc
+.pytest_cache
+frontend/node_modules
+frontend/dist
+.agents
+.claude
+skills-lock.json
+*.xlsx
+*.csv
+.env
+deploy
+docs

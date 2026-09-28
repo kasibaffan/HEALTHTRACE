@@ -1,269 +1,74 @@
-# MedGuard — Healthcare Pipeline Sentinel
+# HEALTH TRACE
 
-A real-time log anomaly detector with a live alert feed, built for a
-healthcare technology company (Acentra Health) that runs Medicaid systems:
-claims, prior authorization, eligibility, and pharmacy.
+Real-time log anomaly monitoring for healthcare pipelines (claims, prior
+authorization, eligibility, pharmacy, batch). HEALTH TRACE tails growing log
+files, keeps a sliding error-rate window per service, learns a baseline for
+each service and hour of day, flags deviations, scores their severity by
+patient impact, and pushes alerts to a live dashboard and to AWS
+(CloudWatch Logs + SNS).
 
-Full design: [SPEC.md](SPEC.md). Built one milestone at a time; see
-"Status" below for what exists today.
+The detection engine is the MedGuard backend described in [SPEC.md](SPEC.md).
+Only synthetic data is used: patient IDs look like `P-000123`.
 
-Only synthetic data is ever used. Patient IDs look like `P-000123`. AWS is
-optional — the app runs fully with no credentials (`AWS_MODE=off`).
+```
+LOG FILES -> TAILER -> SLIDING WINDOW -> BASELINE -> ANOMALY -> SEVERITY -> INCIDENT
+                                                                  |-> SQLite store
+                                                                  |-> WebSocket -> dashboard
+                                                                  '-> CloudWatch Logs / SNS
+```
 
-## Design decisions
+## Quick start (local)
 
-Places where SPEC.md was ambiguous, or where its literal constants needed
-tuning once run against real generated traffic (task instruction: tune only
-config.yaml values, never the formulas themselves — every change below is
-exactly that, and is also called out at its own spot in config.yaml):
-
-- **`baseline.alpha`: 0.1 → 0.05.** At 0.1, a *gradual* ramp (like
-  `claims_degradation`'s ~4.5x rate shift, diluted over the 60s sliding
-  window rather than arriving as a step) causes the EWMA baseline to adapt
-  fast enough to chase the ramp before any single window's z-score crosses
-  the anomaly threshold — so it's never caught, no matter how long the
-  scenario runs. 0.05 makes the baseline "stickier" against exactly this
-  slow-poisoning pattern, while sudden step changes (urgent_prior_auth_
-  failure, eligibility_outage, batch_spike) still trip the threshold on
-  their very first window regardless of alpha, since that check runs against
-  the *already-warm* pre-scenario baseline. Verified with
-  `test_poisoning_protection_sustained_outage_does_not_drift_baseline` (an
-  abrupt outage) and the scenario-severity tests (a gradual ramp).
-- **`severity.patient_factor_cap`: 40 → 400.** SPEC.md's own worked example
-  (§6.6) uses a ~100-event window with 23 affected patients, but its
-  generator section (§7) suggests 20-50 events/sec *across all 5 services*,
-  which at the spec's fixed 60s window size means several hundred events —
-  and so several dozen affected patients — accumulate per window for any
-  service carrying real traffic share. At the original cap of 40, that
-  volume saturates the patient-impact term to 1.0 for almost any sustained
-  elevated error rate, collapsing severity down to criticality alone and
-  erasing the patient-impact signal the cap exists to represent. 400 keeps
-  the term meaningful at the generator's realistic scale while true mass
-  incidents (urgent_prior_auth_failure, eligibility_outage) still saturate
-  it.
-- **Two-tier baseline key.** SPEC.md 6.4 describes a per-(service,
-  hour_of_day) baseline plus a "global per-service" fallback but doesn't say
-  how the fallback is keyed internally. Modeled it as one more bucket per
-  service, `hour_of_day = -1`, updated on every window alongside whichever
-  hourly bucket is current — simplest option that needs no separate code
-  path in the store schema.
-- **Poisoning protection is per-metric, not per-window.** SPEC.md 6.4 says
-  "update() is called only when the Anomaly Engine marks the window as
-  normal" without specifying whether that's a single verdict per window or
-  one per metric (error_rate vs latency). Implemented it per-metric: a
-  window anomalous on latency alone still lets the error-rate baseline learn
-  from it, and vice versa. Simplest option that doesn't let an anomaly in
-  one metric block learning on an unrelated one.
-- **A user's access baseline samples once per 10-minute period, not per
-  event.** SPEC.md 6.7 says a user has "the user's own EWMA baseline" of
-  distinct-patient access but doesn't say how often it updates. Distinct-
-  patient count *within an ongoing burst* only ever climbs, so updating on
-  every event would let a real bulk-access burst poison its own baseline
-  mid-burst before it finishes — the access-detector analogue of the
-  gradual-ramp problem above, except guaranteed to occur here since a
-  rolling count can't decrease. Sampling once per rolling-window period
-  (same length as the window itself) means a burst shorter than 10 minutes
-  never gets the chance to drag its own threshold up while it's happening.
-- **A brand-new user's bulk-access threshold is the flat floor, not zero.**
-  SPEC.md 6.7 gives the threshold as `max(3 * user_baseline, 50)` without
-  saying what happens before a baseline exists. Treating "no baseline yet"
-  as baseline=0 makes the formula fall through to the flat floor (50)
-  automatically — exactly the right behavior, since a user with no history
-  suddenly touching hundreds of patients is at least as suspicious as one
-  exceeding an established baseline, not exempt from detection until they
-  have one.
-- **Cooldown opens a new incident rather than reopening the resolved one.**
-  SPEC.md 6.8 says a resolved incident's fingerprint suppresses
-  notifications for 5 minutes but "still record[s] the alerts" — read as: a
-  recurrence during cooldown gets its own new incident (since the old one is
-  legitimately done, with its own MTTR already recorded), just with
-  `should_notify=False` carried onto it until the cooldown window elapses,
-  rather than reanimating the resolved incident.
-- **MTTR is measured from `opened_at`, not `acknowledged_at`.** SPEC.md 6.8
-  tracks both timestamps but doesn't spell out which anchors MTTR;
-  "time to resolve" most naturally reads as the incident's full lifetime.
-- **`hipaa.bulk_min_threshold`: 50 → 200.** Found by actually running the
-  backend against real generator output, not just unit tests: at the
-  generator's own suggested rate, ~30 users sharing ~7 audit events/sec
-  produce roughly 130 distinct-patient touches per user per 10-minute
-  window under entirely normal traffic (verified directly), so the spec's
-  literal floor of 50 flagged nearly every ordinary user as CRITICAL "bulk
-  access" within the first 10 minutes of any session — the exact kind of
-  mismatch as `patient_factor_cap` above, just for HIPAA instead of service
-  severity. 200 sits well above that normal range while staying safely below
-  the demo's bulk_phi_access scenario (300 patients), which still reliably
-  fires (swept both floors empirically before picking this one).
-- **The backend replays existing logs from the start only on a genuine first
-  run.** SPEC.md 6.4 says "the backend replays this file on first run", but
-  6.1 separately describes the tailer's own default as "starting from the
-  end", with `--from-start` as an opt-in for replay. Resolved by having the
-  pipeline itself pick: tail from the start when no baseline has ever been
-  persisted (nothing learned yet), from the end once one has (a restart
-  shouldn't reprocess a day of history). Also found by actually running the
-  backend — a naive "always start from the end" import silently skipped an
-  entire backfill file.
-
-## Status: Milestone 5 — API + WebSocket + notifier
-
-Done (Milestone 1):
-
-- Repo layout (`config.yaml`, `.env.example`, `Makefile`, `generator/`,
-  `backend/`).
-- `backend/app/models.py`: pydantic models for every shape in the pipeline
-  (`AppEvent`, `AuditEvent`, `WindowMetrics`, `Anomaly`, `Alert`, `Incident`,
-  `IncidentEvent`) — filled in incrementally as each milestone needs them.
-- `generator/generate.py` + `generator/scenarios.py`: synthetic log
-  generator covering normal traffic and all 9 scenarios from SPEC.md
-  section 7.
-- Tests confirming every generated line validates against the models, and
-  that each scenario produces the traffic shape the spec promises.
-
-Done (Milestone 2):
-
-- `backend/app/config.py`: loads `config.yaml` (detection constants) and
-  `.env` (AWS mode, paths) via pydantic-settings.
-- `backend/app/ingest/tailer.py`: polling async tailer — handles append,
-  buffered partial lines, in-place truncation, and rotation (new inode at
-  the same path), all without crashing on a missing file.
-- `backend/app/parse/parser.py`: JSON-line -> `AppEvent`/`AuditEvent`,
-  counting malformed lines instead of raising.
-- `backend/app/parse/enricher.py`: attaches service criticality and
-  priority weight to app events.
-- `backend/app/detect/window.py`: per-service 60s sliding window, emitting
-  `WindowMetrics` every 5s of *event time* (not wall clock).
-- Tests for all of the above (39 total, all passing).
-
-Done (Milestone 3):
-
-- `backend/app/store/db.py`: aiosqlite schema for all 6 tables (SPEC.md
-  6.10), with the `baselines` read/write methods this milestone needs; the
-  rest gain their own methods in Milestones 4-5.
-- `backend/app/detect/baseline.py`: EWMA baseline per (service, hour_of_day)
-  with a global per-service fallback, warm-up, and persistence
-  (save/load against the store).
-- `backend/app/detect/anomaly.py`: z-score checks for error rate and p95
-  latency, with per-metric poisoning protection (only feeds the baseline
-  from windows judged non-anomalous for that metric).
-- `backend/app/detect/severity.py`: the continuous service-anomaly score and
-  the rule-based HIPAA severity table (the HIPAA *detector* that produces
-  its inputs is Milestone 4; this module's formula is ready now).
-- Two config.yaml values tuned against real generator output — see "Design
-  decisions" above.
-- Tests: baseline warm-up/fallback/persistence, poisoning protection under a
-  sustained outage, severity formula boundaries, the HIPAA severity table,
-  and a full enrich→window→baseline→anomaly→severity run of every service
-  scenario from SPEC.md §7 confirming it lands in its expected severity
-  (27 new tests; 66 total, all passing).
-
-Done (Milestone 4):
-
-- `backend/app/detect/access.py`: per-user rolling 10-minute HIPAA access
-  detector — bulk access, bulk export, off-hours, and region mismatch —
-  with its own poisoning-protected baseline (see "Design decisions").
-- `backend/app/incidents/engine.py`: full incident lifecycle — fingerprint
-  dedup, escalation, cooldown, auto-resolve (6 normal windows for a service
-  incident, 10 minutes of silence for a HIPAA one), and MTTR.
-- `backend/app/store/db.py`: read/write methods for alerts, incidents,
-  incident_events, and access_stats (metrics history is Milestone 5, tied
-  to the running pipeline).
-- Tests: every access pattern and its edge cases, incident dedup/escalation/
-  cooldown/auto-resolve/MTTR, and store round-trips for everything above
-  (34 new tests; 100 total, all passing).
-
-Done (Milestone 5):
-
-- `backend/app/notify/aws.py`: CloudWatch Logs (every alert) + SNS
-  (HIGH/CRITICAL incidents only), modes off/mock/live, its own async
-  queue + worker with exponential backoff (5 attempts) so a slow or failing
-  AWS call never blocks detection.
-- `backend/app/pipeline.py`: wires ingest → parse/enrich → window/access →
-  baseline/anomaly/severity → incidents → store/broadcast/notify together;
-  first-run backfill replay (see "Design decisions"); event-time-driven
-  HIPAA timeout sweep.
-- `backend/app/api/routes.py` + `api/ws.py` + `main.py`: the full REST API
-  and `/ws` endpoint (snapshot on connect, then metric/alert/incident_update/
-  heartbeat messages), wired to a running pipeline via FastAPI's lifespan.
-- Tests: notifier modes/retry/non-blocking-under-load, pipeline first-run
-  vs. warm-start tailing, REST endpoints, and WebSocket snapshot + live
-  streaming (30 new tests; 127 total, all passing) — plus manually running
-  the real server end-to-end (backfill replay, live scenario injection,
-  REST responses), which is what caught both bugs documented above.
-
-- **Bug found via live testing, fixed**: `SlidingWindow.add()` evicted
-  against the *newest* event's ts immediately on append, before its own
-  catch-up loop ran. After a real traffic gap (e.g. two separate demo
-  scenario injections minutes apart) followed by one trigger event far in
-  the future, that eager eviction wiped out not-yet-snapshotted data before
-  the catch-up steps could see it — so a scenario's tail could silently
-  vanish from the metrics/alerts an operator would actually see. Fixed by
-  only evicting per-step, inside the catch-up loop, using each step's own
-  window_end.
-
-Not built yet (Milestone 6): the frontend. `make frontend` and `make demo`
-are placeholders until it exists; `make backend` now works.
-
-Time-boxed at the end of Milestone 5: milestones 6 (frontend) and 7 (Docker,
-end-to-end test, final polish) are not yet built.
-
-## Setup
-
-Requires Python 3.11+.
+Requirements: Python 3.11+, Node 20+.
 
 ```bash
-cd medguard
 python -m venv .venv
-. .venv/Scripts/activate        # Windows; use `source .venv/bin/activate` on macOS/Linux
-pip install -e backend[dev]
+.venv/Scripts/activate            # macOS/Linux: source .venv/bin/activate
+pip install -e "backend[dev]"
+cd frontend && npm install && cd ..
+
+python -m generator.generate --backfill-hours 2      # seed history (once)
+python -m generator.generate --rate 30                # terminal 1: live logs
+cd backend && uvicorn app.main:app --port 8010        # terminal 2: API
+cd frontend && npm run dev                            # terminal 3: UI on :5173
 ```
 
-## Running the generator
+Open http://localhost:5173. The dev server proxies `/api` and `/ws` to the
+backend (override with `HEALTHTRACE_BACKEND=http://host:port`).
 
-Run as a module (`-m generator.generate`, not `python generator/generate.py`)
-from the `medguard/` root, so its `from generator.scenarios import ...` finds
-the package:
-
-```bash
-# Normal traffic forever, ~30 events/sec, appending to data/logs/{app,audit}.log
-python -m generator.generate --rate 30
-
-# 24h of historical normal traffic, so every (service, hour_of_day) baseline
-# bucket is warm before a demo (SPEC.md section 6.4 seeding).
-python -m generator.generate --backfill-hours 24
-
-# Inject one scenario directly (useful without the dashboard / for tests):
-python -m generator.generate --scenario urgent_prior_auth_failure --duration 60
-```
-
-Scenario names (SPEC.md section 7): `urgent_prior_auth_failure`,
-`eligibility_outage`, `claims_degradation`, `batch_spike`,
-`latency_degradation`, `bulk_phi_access`, `off_hours_access`,
-`region_mismatch`, `recovery`.
-
-While running with no flags, the generator polls `data/control.json` once a
-second for a scenario written by the dashboard's demo panel (a later
-milestone's `POST /api/demo/inject`).
+With Docker: `docker compose up --build`, then open http://localhost:8080.
 
 ## Tests
 
 ```bash
-make test
-# or: python -m pytest backend/tests -q
+python -m pytest backend/tests -q      # 152 tests
+cd frontend && npm run build           # typecheck + production build
 ```
 
-## Makefile targets
+## Demo script
 
-| Target | Does |
-|---|---|
-| `make gen` | stream normal traffic, polling for demo injections |
-| `make backfill` | write 24h of historical normal traffic |
-| `make backend` | run the FastAPI app (Milestone 5+) |
-| `make frontend` | run the Vite dev server (Milestone 6+) |
-| `make test` | run the backend test suite |
-| `make demo` | backfill + generator + backend + frontend together (Milestone 7) |
+1. Open the dashboard: every service is healthy.
+2. Press `Ctrl K`, choose *Inject Urgent prior-auth failure*: a CRITICAL
+   anomaly opens within seconds. Open it to see why it was detected.
+3. Inject *Batch error spike*: a higher error rate, but it scores LOW because
+   no patients are affected.
+4. Inject *Bulk PHI access*: a HIPAA access anomaly for user U-117.
+5. Inject *Recovery*: anomalies resolve on their own and MTTR is recorded.
 
-## Architecture
+## Documentation
 
-See SPEC.md section 3 for the full pipeline diagram: ingestor → parser/
-enricher → sliding window + access detector → baseline/anomaly/severity
-engines → incident engine → store / WebSocket broadcaster / AWS notifier →
-frontend.
+- [Architecture](docs/architecture.md)
+- [Backend](docs/backend.md) and the [changes made during stabilisation](docs/backend.md#stabilisation-log)
+- [Real-time events](docs/realtime.md)
+- [API](docs/api.md)
+- [Frontend](docs/frontend.md)
+- [AWS deployment](docs/aws-deployment.md)
+- [Development](docs/development.md)
+
+## Configuration
+
+Detection constants live in `config.yaml`. Deployment settings are
+environment variables (see `.env.example`): `AWS_MODE` (off | mock | live),
+`AWS_REGION`, `CLOUDWATCH_LOG_GROUP`, `SNS_TOPIC_ARN`, `DEMO_MODE`,
+`PROJECT_NAME`, `ENVIRONMENT`, `CORS_ORIGINS`, `OPERATOR_TOKEN`, `LOG_DIR`,
+`DB_PATH`.

@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  HEALTH TRACE on ECS Fargate: one task (API + WebSocket + UI, plus the demo
+  log generator sidecar) behind an Application Load Balancer, alerting to
+  CloudWatch Logs and SNS through a least-privilege task role.
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: ECR image URI, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/healthtrace:latest
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets in different AZs (ALB and task).
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate for HTTPS. Leave empty to serve plain HTTP (testing only).
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email subscribed to the SNS alert topic.
+  EnvironmentName:
+    Type: String
+    Default: production
+  ProjectName:
+    Type: String
+    Default: Medicaid Pipeline
+  RunGenerator:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Run the synthetic log generator sidecar (demo). Set false when real logs are mounted.
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+  HasEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  WithGenerator: !Equals [!Ref RunGenerator, "true"]
+
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub healthtrace-alerts-${EnvironmentName}
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /healthtrace/${EnvironmentName}/alerts
+      RetentionInDays: 90
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /healthtrace/${EnvironmentName}/app
+      RetentionInDays: 30
+
+  OperatorToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Token required for acknowledge/resolve/mute/demo/AWS-test actions.
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-operator-token
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref OperatorToken
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: alerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogGroups]
+                Resource:
+                  - !GetAtt AlertLogGroup.Arn
+                  - !Sub "${AlertLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*"
+              - Effect: Allow
+                Action: [sns:Publish, sns:GetTopicAttributes]
+                Resource: !Ref AlertTopic
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HEALTH TRACE load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HEALTH TRACE task, reachable only from the load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        # WebSocket clients get a heartbeat every 10s; keep idle connections open.
+        - { Key: idle_timeout.timeout_seconds, Value: "300" }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8000
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "15" }
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: !If
+        - HasCertificate
+        - - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: "443", StatusCode: HTTP_301 }
+        - - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub healthtrace-${EnvironmentName}
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      EphemeralStorage: { SizeInGiB: 30 }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: data
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings: [{ ContainerPort: 8000 }]
+          MountPoints: [{ SourceVolume: data, ContainerPath: /app/data }]
+          Environment:
+            - { Name: AWS_MODE, Value: live }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: CLOUDWATCH_LOG_GROUP, Value: !Ref AlertLogGroup }
+            - { Name: SNS_TOPIC_ARN, Value: !Ref AlertTopic }
+            - { Name: ENVIRONMENT, Value: !Ref EnvironmentName }
+            - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+            - { Name: DEMO_MODE, Value: !Ref RunGenerator }
+            - { Name: CORS_ORIGINS, Value: "" }
+          Secrets:
+            - { Name: OPERATOR_TOKEN, ValueFrom: !Ref OperatorToken }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+        - !If
+          - WithGenerator
+          - Name: generator
+            Image: !Ref ImageUri
+            Essential: false
+            Command:
+              - sh
+              - -c
+              - "[ -s /app/data/logs/app.log ] || python -m generator.generate --backfill-hours 2; exec python -m generator.generate --rate 30"
+            MountPoints: [{ SourceVolume: data, ContainerPath: /app/data }]
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref AppLogGroup
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: generator
+          - !Ref AWS::NoValue
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      # The tag's conditional Ref also orders the service after the HTTPS
+      # listener, which is what attaches the target group when a cert is set.
+      Tags:
+        - Key: listener
+          Value: !If [HasCertificate, !Ref HttpsListener, !Ref HttpListener]
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      # One writer: detection state is per task. Replace rather than overlap
+      # so two pipelines never page for the same anomaly.
+      DesiredCount: 1
+      DeploymentConfiguration: { MinimumHealthyPercent: 0, MaximumPercent: 100 }
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: app, ContainerPort: 8000, TargetGroupArn: !Ref TargetGroup }
+
+Outputs:
+  Url:
+    Value: !If [HasCertificate, !Sub "https://${LoadBalancer.DNSName}", !Sub "http://${LoadBalancer.DNSName}"]
+    Description: Point a Route 53 alias at the load balancer for a custom domain.
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  OperatorTokenSecret:
+    Value: !Ref OperatorToken
+    Description: Read with `aws secretsmanager get-secret-value --secret-id <arn>`.
