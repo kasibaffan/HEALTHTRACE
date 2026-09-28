@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import aiosqlite
 
-from app.models import Alert, Incident, IncidentEvent
+from app.models import Alert, Incident, IncidentEvent, WindowMetrics
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metrics (
@@ -160,6 +160,47 @@ class Store:
         )
         rows = await cursor.fetchall()
         return [BaselineRow(*row) for row in rows]
+
+    # -- metrics (Milestone 5): 24h retention per SPEC.md 6.10 ----------------
+
+    async def save_metrics(self, metrics: WindowMetrics) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO metrics
+                (service, window_end, total, errors, error_rate, p95_latency_ms,
+                 urgent_errors, affected_patients_urgent, affected_patients_routine, malformed_lines)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                metrics.service, metrics.window_end.isoformat(), metrics.total, metrics.errors,
+                metrics.error_rate, metrics.p95_latency_ms, metrics.urgent_errors,
+                metrics.affected_patients_urgent, metrics.affected_patients_routine, metrics.malformed_lines,
+            ),
+        )
+        cutoff = (metrics.window_end - timedelta(hours=24)).isoformat()
+        await self.conn.execute("DELETE FROM metrics WHERE window_end < ?", (cutoff,))
+        await self.conn.commit()
+
+    async def list_metrics(self, *, service: str, minutes: int = 15, before: Optional[datetime] = None) -> list[WindowMetrics]:
+        end = before or datetime.now(timezone.utc)
+        since = (end - timedelta(minutes=minutes)).isoformat()
+        cursor = await self.conn.execute(
+            """
+            SELECT service, window_end, total, errors, error_rate, p95_latency_ms,
+                   urgent_errors, affected_patients_urgent, affected_patients_routine, malformed_lines
+            FROM metrics WHERE service = ? AND window_end >= ? ORDER BY window_end ASC
+            """,
+            (service, since),
+        )
+        rows = await cursor.fetchall()
+        return [
+            WindowMetrics(
+                service=r[0], window_end=datetime.fromisoformat(r[1]), total=r[2], errors=r[3], error_rate=r[4],
+                p95_latency_ms=r[5], urgent_errors=r[6], affected_patients_urgent=r[7],
+                affected_patients_routine=r[8], malformed_lines=r[9],
+            )
+            for r in rows
+        ]
 
     # -- alerts (Milestone 4) -------------------------------------------------
 

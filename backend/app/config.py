@@ -38,6 +38,7 @@ class AnomalyConfig(BaseModel):
     error_rate_min_errors: int
     error_rate_min_rate: float
     latency_z_threshold: float
+    latency_min_std_ms: float
 
 
 class SeverityThresholds(BaseModel):
@@ -58,6 +59,7 @@ class HipaaConfig(BaseModel):
     bulk_multiplier_high: float
     bulk_multiplier_critical: float
     bulk_min_threshold: float
+    export_min_threshold: float
     export_critical_records: int
     off_hours_start: str
     off_hours_end: str

@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import random
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.config import HipaaConfig
+from app.config import HipaaConfig, load_config
 from app.detect.access import AccessDetector
 from app.models import AuditEvent
+from generator.generate import generate_batch
 
 T0 = datetime(2026, 9, 28, 13, 0, 0, tzinfo=timezone.utc)  # 13:00, inside business hours
 
 CONFIG = HipaaConfig(
-    bulk_multiplier_high=3, bulk_multiplier_critical=6, bulk_min_threshold=50,
+    bulk_multiplier_high=3, bulk_multiplier_critical=6, bulk_min_threshold=50, export_min_threshold=50,
     export_critical_records=100, off_hours_start="07:00", off_hours_end="21:00",
     off_hours_high_records=20, region_mismatch_medium_max=5,
 )
@@ -150,6 +152,32 @@ def test_rolling_window_evicts_after_10_minutes():
     # 11 minutes later: the old 60 should have rolled off the 10-minute window.
     anomalies = detector.evaluate(audit_event(11 * 60, patient_id="P-999999"))
     assert "hipaa_bulk_access" not in [a.kind for a in anomalies]
+
+
+def test_real_config_does_not_false_positive_on_normal_traffic():
+    """Regression test: found by actually running the backend against real
+    generator output (see README "Design decisions" — bulk_min_threshold).
+    30 minutes of pure normal traffic must never trip hipaa_bulk_access, and
+    the real bulk_phi_access scenario must still reliably fire."""
+    config = load_config().hipaa
+    detector = AccessDetector(config)
+
+    rng = random.Random(5)
+    T0 = datetime(2026, 9, 28, 9, 0, 0, tzinfo=timezone.utc)
+    _, normal_events = generate_batch(None, 1800, 40, T0, rng)
+    for raw in normal_events:
+        anomalies = detector.evaluate(AuditEvent.model_validate(raw))
+        assert not any(a.kind == "hipaa_bulk_access" for a in anomalies)
+
+    scenario_detector = AccessDetector(config)
+    rng2 = random.Random(99)
+    _, scenario_events = generate_batch("bulk_phi_access", 300, 40, T0, rng2)
+    fired = any(
+        a.kind == "hipaa_bulk_access"
+        for raw in scenario_events
+        for a in scenario_detector.evaluate(AuditEvent.model_validate(raw))
+    )
+    assert fired
 
 
 def test_users_are_tracked_independently():

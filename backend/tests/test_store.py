@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.models import Alert, Incident, IncidentEvent
+from app.models import Alert, Incident, IncidentEvent, WindowMetrics
 from app.store.db import Store
 
 T0 = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
@@ -20,6 +20,36 @@ async def store(tmp_path: Path):
     await s.connect()
     yield s
     await s.close()
+
+
+def make_metrics(window_end, **overrides) -> WindowMetrics:
+    base = dict(
+        service="claims", window_end=window_end, total=100, errors=5, error_rate=0.05,
+        p95_latency_ms=200.0, urgent_errors=0, affected_patients_urgent=0, affected_patients_routine=5,
+    )
+    base.update(overrides)
+    return WindowMetrics(**base)
+
+
+async def test_save_and_list_metrics_within_window(store: Store):
+    await store.save_metrics(make_metrics(T0))
+    await store.save_metrics(make_metrics(T0 + timedelta(minutes=5)))
+    await store.save_metrics(make_metrics(T0 + timedelta(minutes=20)))  # outside a 15-min lookback from the last
+
+    rows = await store.list_metrics(service="claims", minutes=15, before=T0 + timedelta(minutes=20))
+    assert len(rows) == 2  # T0 and T0+5min are within 15 minutes of T0+20min; T0 itself is exactly at the edge
+
+    rows_narrow = await store.list_metrics(service="claims", minutes=1, before=T0 + timedelta(minutes=20))
+    assert len(rows_narrow) == 1
+
+
+async def test_metrics_older_than_24h_are_pruned(store: Store):
+    await store.save_metrics(make_metrics(T0))
+    await store.save_metrics(make_metrics(T0 + timedelta(hours=25)))  # triggers pruning of the first row
+
+    rows = await store.list_metrics(service="claims", minutes=60 * 30, before=T0 + timedelta(hours=25))
+    assert len(rows) == 1
+    assert rows[0].window_end == T0 + timedelta(hours=25)
 
 
 async def test_save_and_list_alerts(store: Store):

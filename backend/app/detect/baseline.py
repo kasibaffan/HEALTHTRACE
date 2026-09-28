@@ -76,6 +76,12 @@ class BaselineEngine:
     def is_ready(self, service: str, hour_of_day: int, metric: str) -> bool:
         return self.get(service, hour_of_day, metric) is not None
 
+    def is_empty(self) -> bool:
+        """True until anything has ever been learned or reloaded — used by the
+        pipeline to detect a first run, per SPEC.md 6.4's "backend replays
+        [the backfill] on first run so every hour bucket is ready"."""
+        return not self._cells
+
     # -- persistence (SPEC.md 6.4: every 60s and on shutdown; reload on startup) --
 
     async def save(self, store: Store) -> None:

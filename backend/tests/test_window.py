@@ -114,6 +114,23 @@ def test_events_older_than_60s_are_evicted():
     assert snap.total == 1
 
 
+def test_catch_up_after_a_long_gap_still_sees_data_from_just_before_the_gap():
+    """Regression test: a real traffic gap followed by one trigger event far
+    in the future used to wipe out not-yet-snapshotted data via an eager
+    eviction keyed off the *new* event's ts, before the catch-up loop ever
+    ran (found by actually running the pipeline, not just steady synthetic
+    traffic — see README "Design decisions")."""
+    window = SlidingWindow(window_seconds=60, step_seconds=5)
+    window.add(make_event(0))
+    window.add(make_event(1, level="ERROR", status=500))
+    window.add(make_event(2, level="ERROR", status=500))
+    # A long gap, then one trigger event far in the future.
+    emitted = window.add(make_event(500))
+    first_catch_up = emitted[0]
+    assert first_catch_up.total == 3
+    assert first_catch_up.errors == 2
+
+
 def test_services_are_windowed_independently():
     window = SlidingWindow(window_seconds=60, step_seconds=5)
     for i in range(6):

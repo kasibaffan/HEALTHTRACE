@@ -40,8 +40,13 @@ class SlidingWindow:
         event = enriched.event
         sw = self._windows.setdefault(event.service, _ServiceWindow())
         sw.events.append(enriched)
-        self._evict_expired(sw, event.ts)
-
+        # No eager eviction here: after a long gap in traffic, the *newest*
+        # event's ts can be far beyond the pending catch-up steps below, and
+        # evicting against it immediately would wipe out the very data those
+        # steps still need to snapshot. Eviction happens per-step instead,
+        # using each step's own window_end (see the loop below) — found by
+        # actually running the pipeline through a real gap-then-burst
+        # sequence, not just steady synthetic traffic.
         if sw.next_emit_at is None:
             sw.next_emit_at = event.ts + timedelta(seconds=self.step_seconds)
             return []

@@ -38,6 +38,16 @@ anomaly:
   error_rate_min_errors: 5
   error_rate_min_rate: 0.05
   latency_z_threshold: 4.0
+  # Separate from min_std above (documented in README under "Design
+  # decisions"): min_std=0.01 is a sensible 1% floor for error_rate (a 0-1
+  # fraction), but applied to p95_latency_ms (measured in tens-to-thousands
+  # of milliseconds) it's a units mismatch — 0.01ms is negligible, so any
+  # tiny natural fluctuation in a large-sample p95 estimate produces a huge
+  # z-score. Found by running the anomaly engine against 10 seeds of pure
+  # normal traffic (29 false positives at 0.01ms; 0 at every value from
+  # 5ms up); 20ms keeps a comfortable margin while a real 5x latency spike
+  # still fires with z in the hundreds, nowhere near this floor.
+  latency_min_std_ms: 20.0
 
 severity:
   deviation_z_cap: 6
@@ -60,7 +70,22 @@ severity:
 hipaa:
   bulk_multiplier_high: 3
   bulk_multiplier_critical: 6
-  bulk_min_threshold: 50
+  # Tuned up from the spec's literal 50 (documented in README under "Design
+  # decisions"): at the generator's own suggested rate, ~30 users sharing
+  # ~7 audit events/sec produce roughly 130 distinct-patient touches per
+  # user per 10-minute window under entirely normal traffic, so a floor of
+  # 50 flags nearly every ordinary user as CRITICAL "bulk access" within
+  # the first 10 minutes of any session (found by actually running the
+  # backend against generated traffic, not just unit tests). 200 sits
+  # comfortably above that normal range while still well below the demo's
+  # bulk_phi_access scenario (300 patients), which still reliably fires.
+  bulk_min_threshold: 200
+  # A separate, much smaller floor than bulk_min_threshold: EXPORT_RECORDS
+  # is only ~2% of audit actions (~2.8 exports/user/10min under normal
+  # traffic, verified directly), so reusing the 200 bulk-access floor here
+  # would make the MEDIUM export tier (below export_critical_records)
+  # unreachable in practice.
+  export_min_threshold: 20
   export_critical_records: 100
   off_hours_start: "07:00"
   off_hours_end: "21:00"

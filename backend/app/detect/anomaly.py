@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import sqrt
+from typing import Optional
 
 from app.config import AnomalyConfig
 from app.detect.baseline import BaselineEngine
@@ -74,7 +75,7 @@ class AnomalyEngine:
         baseline = self._baseline.get(metrics.service, hour, "p95_latency_ms")
         if baseline is None:
             return True
-        z = self._z_score(metrics.p95_latency_ms, baseline.mean, baseline.variance)
+        z = self._z_score(metrics.p95_latency_ms, baseline.mean, baseline.variance, self._config.latency_min_std_ms)
         is_anomaly = z >= self._config.latency_z_threshold
         if is_anomaly:
             anomalies.append(
@@ -90,6 +91,6 @@ class AnomalyEngine:
             )
         return not is_anomaly
 
-    def _z_score(self, value: float, mean: float, variance: float) -> float:
-        std_eff = max(sqrt(max(variance, 0.0)), self._config.min_std)
+    def _z_score(self, value: float, mean: float, variance: float, min_std: Optional[float] = None) -> float:
+        std_eff = max(sqrt(max(variance, 0.0)), min_std if min_std is not None else self._config.min_std)
         return (value - mean) / std_eff

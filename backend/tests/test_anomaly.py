@@ -8,10 +8,16 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.config import AnomalyConfig, BaselineConfig
+import random
+
+from app.config import AnomalyConfig, BaselineConfig, load_config
 from app.detect.anomaly import AnomalyEngine
 from app.detect.baseline import BaselineEngine
 from app.models import WindowMetrics
+from app.parse.enricher import Enricher
+from app.detect.window import SlidingWindow
+from app.models import AppEvent
+from generator.generate import generate_batch
 
 T0 = datetime(2026, 9, 28, 9, 0, 0, tzinfo=timezone.utc)  # fixed hour=9, for determinism
 
@@ -21,6 +27,7 @@ ANOMALY_CONFIG = AnomalyConfig(
     error_rate_min_errors=5,
     error_rate_min_rate=0.05,
     latency_z_threshold=4.0,
+    latency_min_std_ms=20.0,
 )
 BASELINE_CONFIG = BaselineConfig(alpha=0.1, warmup_windows=12)
 
@@ -123,3 +130,30 @@ def test_recovery_after_outage_resumes_learning():
 
     mean_after_recovery = baseline.get("claims", 9, "error_rate").mean
     assert mean_after_recovery == pytest.approx(0.02, abs=0.01)
+
+
+def test_real_config_does_not_false_positive_on_normal_traffic_across_seeds():
+    """Regression test: found by running the anomaly engine against real
+    generator output across multiple seeds, not just one (see README
+    "Design decisions" — anomaly.latency_min_std_ms). p95 latency's natural
+    window-to-window variance can occasionally be tiny by chance; the old
+    shared min_std=0.01 (fine for error_rate, a 0-1 fraction) is a units
+    mismatch for latency in milliseconds and spuriously fires on that noise."""
+    config = load_config()
+    T0 = datetime(2026, 9, 28, 9, 0, 0, tzinfo=timezone.utc)
+
+    for seed in range(10):
+        rng = random.Random(seed)
+        app_events, _ = generate_batch(None, 1800, 40, T0, rng)  # 30 min normal traffic
+
+        enricher = Enricher(config)
+        window = SlidingWindow(config.window.size_seconds, config.window.step_seconds)
+        baseline = BaselineEngine(config.baseline)
+        anomaly_engine = AnomalyEngine(config.anomaly, baseline)
+
+        for raw in app_events:
+            event = AppEvent.model_validate(raw)
+            enriched = enricher.enrich(event)
+            for metrics in window.add(enriched):
+                result = anomaly_engine.evaluate(metrics)
+                assert result.anomalies == [], (seed, metrics.service, metrics.window_end, result.anomalies)

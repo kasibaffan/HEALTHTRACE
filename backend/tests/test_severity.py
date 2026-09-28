@@ -21,7 +21,7 @@ SEVERITY_CONFIG = SeverityConfig(
     thresholds=THRESHOLDS,
 )
 HIPAA_CONFIG = HipaaConfig(
-    bulk_multiplier_high=3, bulk_multiplier_critical=6, bulk_min_threshold=50,
+    bulk_multiplier_high=3, bulk_multiplier_critical=6, bulk_min_threshold=50, export_min_threshold=50,
     export_critical_records=100, off_hours_start="07:00", off_hours_end="21:00",
     off_hours_high_records=20, region_mismatch_medium_max=5,
 )

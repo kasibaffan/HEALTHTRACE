@@ -82,8 +82,28 @@ exactly that, and is also called out at its own spot in config.yaml):
 - **MTTR is measured from `opened_at`, not `acknowledged_at`.** SPEC.md 6.8
   tracks both timestamps but doesn't spell out which anchors MTTR;
   "time to resolve" most naturally reads as the incident's full lifetime.
+- **`hipaa.bulk_min_threshold`: 50 → 200.** Found by actually running the
+  backend against real generator output, not just unit tests: at the
+  generator's own suggested rate, ~30 users sharing ~7 audit events/sec
+  produce roughly 130 distinct-patient touches per user per 10-minute
+  window under entirely normal traffic (verified directly), so the spec's
+  literal floor of 50 flagged nearly every ordinary user as CRITICAL "bulk
+  access" within the first 10 minutes of any session — the exact kind of
+  mismatch as `patient_factor_cap` above, just for HIPAA instead of service
+  severity. 200 sits well above that normal range while staying safely below
+  the demo's bulk_phi_access scenario (300 patients), which still reliably
+  fires (swept both floors empirically before picking this one).
+- **The backend replays existing logs from the start only on a genuine first
+  run.** SPEC.md 6.4 says "the backend replays this file on first run", but
+  6.1 separately describes the tailer's own default as "starting from the
+  end", with `--from-start` as an opt-in for replay. Resolved by having the
+  pipeline itself pick: tail from the start when no baseline has ever been
+  persisted (nothing learned yet), from the end once one has (a restart
+  shouldn't reprocess a day of history). Also found by actually running the
+  backend — a naive "always start from the end" import silently skipped an
+  entire backfill file.
 
-## Status: Milestone 4 — Access detector + incident engine + store
+## Status: Milestone 5 — API + WebSocket + notifier
 
 Done (Milestone 1):
 
@@ -150,9 +170,40 @@ Done (Milestone 4):
   cooldown/auto-resolve/MTTR, and store round-trips for everything above
   (34 new tests; 100 total, all passing).
 
-Not built yet (later milestones): API/WebSocket, notifier, pipeline wiring,
-and frontend. `make backend`, `make frontend`, and `make demo` are
-placeholders until those exist.
+Done (Milestone 5):
+
+- `backend/app/notify/aws.py`: CloudWatch Logs (every alert) + SNS
+  (HIGH/CRITICAL incidents only), modes off/mock/live, its own async
+  queue + worker with exponential backoff (5 attempts) so a slow or failing
+  AWS call never blocks detection.
+- `backend/app/pipeline.py`: wires ingest → parse/enrich → window/access →
+  baseline/anomaly/severity → incidents → store/broadcast/notify together;
+  first-run backfill replay (see "Design decisions"); event-time-driven
+  HIPAA timeout sweep.
+- `backend/app/api/routes.py` + `api/ws.py` + `main.py`: the full REST API
+  and `/ws` endpoint (snapshot on connect, then metric/alert/incident_update/
+  heartbeat messages), wired to a running pipeline via FastAPI's lifespan.
+- Tests: notifier modes/retry/non-blocking-under-load, pipeline first-run
+  vs. warm-start tailing, REST endpoints, and WebSocket snapshot + live
+  streaming (30 new tests; 127 total, all passing) — plus manually running
+  the real server end-to-end (backfill replay, live scenario injection,
+  REST responses), which is what caught both bugs documented above.
+
+- **Bug found via live testing, fixed**: `SlidingWindow.add()` evicted
+  against the *newest* event's ts immediately on append, before its own
+  catch-up loop ran. After a real traffic gap (e.g. two separate demo
+  scenario injections minutes apart) followed by one trigger event far in
+  the future, that eager eviction wiped out not-yet-snapshotted data before
+  the catch-up steps could see it — so a scenario's tail could silently
+  vanish from the metrics/alerts an operator would actually see. Fixed by
+  only evicting per-step, inside the catch-up loop, using each step's own
+  window_end.
+
+Not built yet (Milestone 6): the frontend. `make frontend` and `make demo`
+are placeholders until it exists; `make backend` now works.
+
+Time-boxed at the end of Milestone 5: milestones 6 (frontend) and 7 (Docker,
+end-to-end test, final polish) are not yet built.
 
 ## Setup
 

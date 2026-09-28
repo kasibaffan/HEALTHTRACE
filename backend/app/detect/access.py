@@ -28,9 +28,11 @@ in README under "Design decisions" too):
   as "far above an established one".
 - Off-hours and bulk-export use the same 10-minute rolling window as bulk
   access, for one consistent mechanism rather than three window lengths.
-- Bulk export re-uses ``bulk_min_threshold`` (50) as its MEDIUM floor and
-  ``export_critical_records`` (100) as the CRITICAL cutoff the spec already
-  gives, rather than inventing a new config value.
+- Bulk export has its own floor (``export_min_threshold``), separate from
+  bulk access's (``bulk_min_threshold``): exports are a small fraction of
+  audit actions, so the two need very different scales (see README "Design
+  decisions") — below the floor nothing fires; above it but at or below
+  ``export_critical_records`` is MEDIUM; above that is CRITICAL.
 """
 
 from __future__ import annotations
@@ -129,7 +131,7 @@ class AccessDetector:
 
     def _check_bulk_export(self, event: AuditEvent, state: _UserState, anomalies: list[Anomaly]) -> None:
         exported = len({r.patient_id for r in state.records if r.action == "EXPORT_RECORDS"})
-        if exported <= self._config.bulk_min_threshold:
+        if exported <= self._config.export_min_threshold:
             return
         anomalies.append(
             Anomaly(kind="hipaa_bulk_export", ts=event.ts, user_id=event.user_id, metrics={"records": exported})
