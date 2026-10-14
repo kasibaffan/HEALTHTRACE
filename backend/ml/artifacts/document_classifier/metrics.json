@@ -1,0 +1,313 @@
+{
+  "modelVersion": "tfidf-lr-synthetic-v1-d450ebf9",
+  "seed": 42,
+  "dataset": {
+    "source": "synthetic (app.ml.synthetic_data)",
+    "per_class_requested": 300,
+    "total": 2100,
+    "sha256": "d450ebf935016f031f7bf3f565d8d43d63716f673c488059c9ace4043cb3227b",
+    "train_size": 1680,
+    "test_size": 420,
+    "class_distribution_train": {
+      "CLINICAL_REPORT": 240,
+      "IMAGING_REPORT": 240,
+      "LABORATORY_RESULT": 240,
+      "REFERRAL_ORDER": 240,
+      "CLAIM_BILLING": 240,
+      "POLICY_DOCUMENT": 240,
+      "OTHER": 240
+    },
+    "class_distribution_test": {
+      "CLINICAL_REPORT": 60,
+      "IMAGING_REPORT": 60,
+      "LABORATORY_RESULT": 60,
+      "REFERRAL_ORDER": 60,
+      "CLAIM_BILLING": 60,
+      "POLICY_DOCUMENT": 60,
+      "OTHER": 60
+    }
+  },
+  "model_selection": {
+    "cv_folds": 5,
+    "metric": "f1_macro",
+    "cv_scores_by_C": {
+      "1.0": 0.9869268082265684,
+      "3.0": 0.9893085278317038,
+      "10.0": 0.9899039597103695,
+      "30.0": 0.9893082692855124
+    },
+    "chosen_C": 10.0,
+    "vocabulary_size": 7255
+  },
+  "test": {
+    "n": 420,
+    "accuracy": 0.9952380952380953,
+    "macro_precision": 0.9953161592505856,
+    "macro_recall": 0.9952380952380953,
+    "macro_f1": 0.9952377645272986,
+    "per_class": {
+      "CLAIM_BILLING": {
+        "precision": 1.0,
+        "recall": 0.9833333333333333,
+        "f1": 0.9915966386554622,
+        "support": 60
+      },
+      "CLINICAL_REPORT": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 60
+      },
+      "IMAGING_REPORT": {
+        "precision": 1.0,
+        "recall": 0.9833333333333333,
+        "f1": 0.9915966386554622,
+        "support": 60
+      },
+      "LABORATORY_RESULT": {
+        "precision": 0.9836065573770492,
+        "recall": 1.0,
+        "f1": 0.9917355371900827,
+        "support": 60
+      },
+      "OTHER": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 60
+      },
+      "POLICY_DOCUMENT": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 60
+      },
+      "REFERRAL_ORDER": {
+        "precision": 0.9836065573770492,
+        "recall": 1.0,
+        "f1": 0.9917355371900827,
+        "support": 60
+      }
+    },
+    "confusion_matrix": {
+      "labels": [
+        "CLAIM_BILLING",
+        "CLINICAL_REPORT",
+        "IMAGING_REPORT",
+        "LABORATORY_RESULT",
+        "OTHER",
+        "POLICY_DOCUMENT",
+        "REFERRAL_ORDER"
+      ],
+      "rows_are_true_columns_are_predicted": [
+        [
+          59,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          60,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          59,
+          0,
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          0,
+          0,
+          60,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          60,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          60,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          60
+        ]
+      ]
+    },
+    "log_loss": 0.08633765578269958,
+    "brier_score": 0.03021293319761753,
+    "selective": {
+      "min_score": 0.5,
+      "coverage": 0.9809523809523809,
+      "accuracy_when_scored_at_or_above_min": 0.9975728155339806,
+      "accuracy_when_below_min": 0.875
+    }
+  },
+  "challenge_set": {
+    "description": "hand-written, not from the generator; n is small, treat as indicative",
+    "n": 30,
+    "accuracy": 0.9,
+    "macro_precision": 0.9142857142857143,
+    "macro_recall": 0.8928571428571429,
+    "macro_f1": 0.8843537414965985,
+    "per_class": {
+      "CLAIM_BILLING": {
+        "precision": 1.0,
+        "recall": 0.5,
+        "f1": 0.6666666666666666,
+        "support": 4
+      },
+      "CLINICAL_REPORT": {
+        "precision": 1.0,
+        "recall": 0.75,
+        "f1": 0.8571428571428571,
+        "support": 4
+      },
+      "IMAGING_REPORT": {
+        "precision": 0.8,
+        "recall": 1.0,
+        "f1": 0.8888888888888888,
+        "support": 4
+      },
+      "LABORATORY_RESULT": {
+        "precision": 0.8,
+        "recall": 1.0,
+        "f1": 0.8888888888888888,
+        "support": 4
+      },
+      "OTHER": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 6
+      },
+      "POLICY_DOCUMENT": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 4
+      },
+      "REFERRAL_ORDER": {
+        "precision": 0.8,
+        "recall": 1.0,
+        "f1": 0.8888888888888888,
+        "support": 4
+      }
+    },
+    "confusion_matrix": {
+      "labels": [
+        "CLAIM_BILLING",
+        "CLINICAL_REPORT",
+        "IMAGING_REPORT",
+        "LABORATORY_RESULT",
+        "OTHER",
+        "POLICY_DOCUMENT",
+        "REFERRAL_ORDER"
+      ],
+      "rows_are_true_columns_are_predicted": [
+        [
+          2,
+          0,
+          0,
+          1,
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          3,
+          1,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          4,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          4,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          6,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          4,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          4
+        ]
+      ]
+    },
+    "log_loss": 0.6346276998519897,
+    "brier_score": 0.26656094193458557,
+    "selective": {
+      "min_score": 0.5,
+      "coverage": 0.7,
+      "accuracy_when_scored_at_or_above_min": 1.0,
+      "accuracy_when_below_min": 0.6666666666666666
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "modelVersion": "tfidf-lr-synthetic-v1-d450ebf9",
+  "algorithm": "TfidfVectorizer(word 1-2grams, sublinear_tf) + LogisticRegression(multinomial, L2, class_weight=balanced)",
+  "labels": [
+    "CLAIM_BILLING",
+    "CLINICAL_REPORT",
+    "IMAGING_REPORT",
+    "LABORATORY_RESULT",
+    "OTHER",
+    "POLICY_DOCUMENT",
+    "REFERRAL_ORDER"
+  ],
+  "minScoreDefault": 0.5,
+  "scoreMeaning": "Top-class softmax output of the logistic regression. NOT a calibrated probability; do not present it as a percentage chance of being correct.",
+  "trainedAtUtc": "2026-10-14T09:30:05+00:00",
+  "seed": 42,
+  "datasetSha256": "d450ebf935016f031f7bf3f565d8d43d63716f673c488059c9ace4043cb3227b",
+  "datasetSource": "synthetic (app.ml.synthetic_data)",
+  "trainSize": 1680,
+  "testSize": 420,
+  "chosenC": 10.0,
+  "artifactSha256": "ab770cec4c0bbd7ac87b8a8537fef61c63807aba2ba60f9f8019335325fcf7db",
+  "environment": {
+    "python": "3.13.14",
+    "scikit-learn": "1.9.1",
+    "numpy": "2.5.4",
+    "scipy": "1.18.1"
+  },
+  "warning": "Trained on synthetic fictional text only. Not validated on real documents. Decision support, not a clinical or coding decision."
+}
