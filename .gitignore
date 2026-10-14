@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+backend/.venv-phase3/
+__pycache__/
+*.pyc
+backend/uploads/
+*.db
+.playwright-cli/
+*.tsbuildinfo
+.devdb/
+backend/storage_data/
+storage_data/

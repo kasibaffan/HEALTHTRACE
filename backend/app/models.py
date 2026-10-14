@@ -1,0 +1,14 @@
+from datetime import datetime
+from sqlalchemy import String,DateTime,ForeignKey,Text,Integer,Boolean
+from sqlalchemy.orm import Mapped,mapped_column,relationship
+from app.database import Base
+class User(Base):
+ __tablename__='users';id:Mapped[int]=mapped_column(primary_key=True);email:Mapped[str]=mapped_column(String(255),unique=True,index=True);password_hash:Mapped[str]=mapped_column(String(255));created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow);cases:Mapped[list['Case']]=relationship(back_populates='owner')
+class Case(Base):
+ __tablename__='cases';id:Mapped[int]=mapped_column(primary_key=True);public_id:Mapped[str]=mapped_column(String(40),unique=True,index=True);patient_name:Mapped[str]=mapped_column(String(120));condition:Mapped[str]=mapped_column(String(200));procedure:Mapped[str]=mapped_column(String(200));status:Mapped[str]=mapped_column(String(40),default='Needs Human Review');complexity:Mapped[int]=mapped_column(Integer,default=0);owner_id:Mapped[int]=mapped_column(ForeignKey('users.id'),index=True);owner:Mapped[User]=relationship(back_populates='cases');documents:Mapped[list['Document']]=relationship(back_populates='case',cascade='all, delete-orphan');findings:Mapped[list['Finding']]=relationship(back_populates='case',cascade='all, delete-orphan');audits:Mapped[list['Audit']]=relationship(back_populates='case',cascade='all, delete-orphan')
+class Document(Base):
+ __tablename__='documents';id:Mapped[int]=mapped_column(primary_key=True);name:Mapped[str]=mapped_column(String(255));storage_key:Mapped[str]=mapped_column(String(255),unique=True);content_type:Mapped[str]=mapped_column(String(100));size:Mapped[int]=mapped_column(Integer);case_id:Mapped[int]=mapped_column(ForeignKey('cases.id'),index=True);case:Mapped[Case]=relationship(back_populates='documents')
+class Finding(Base):
+ __tablename__='findings';id:Mapped[int]=mapped_column(primary_key=True);criterion:Mapped[str]=mapped_column(String(255));status:Mapped[str]=mapped_column(String(32));requirement:Mapped[str]=mapped_column(Text);fact:Mapped[str|None]=mapped_column(String(255),nullable=True);value:Mapped[str|None]=mapped_column(String(255),nullable=True);rule:Mapped[str|None]=mapped_column(String(255),nullable=True);explanation:Mapped[str]=mapped_column(Text);case_id:Mapped[int]=mapped_column(ForeignKey('cases.id'),index=True);case:Mapped[Case]=relationship(back_populates='findings')
+class Audit(Base):
+ __tablename__='audits';id:Mapped[int]=mapped_column(primary_key=True);created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow);actor:Mapped[str]=mapped_column(String(255));action:Mapped[str]=mapped_column(String(255));target:Mapped[str]=mapped_column(String(255));reason:Mapped[str|None]=mapped_column(Text,nullable=True);case_id:Mapped[int]=mapped_column(ForeignKey('cases.id'),index=True);case:Mapped[Case]=relationship(back_populates='audits')
